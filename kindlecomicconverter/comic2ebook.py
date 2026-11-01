@@ -1555,26 +1555,19 @@ def makeZIP(zipfilename, basedir, job_progress='', isepub=False):
         move(basedir, zipfilename)
         return zipfilename
     start = perf_counter()
-    if SEVENZIP in available_archive_tools():
-        if isepub:
-            mimetypeFile = open(os.path.join(basedir, '!mimetype'), 'w')
-            mimetypeFile.write('application/epub+zip')
-            mimetypeFile.close()
+    if not isepub and SEVENZIP in available_archive_tools():
         subprocess_run([SEVENZIP, 'a', '-mx0', '-tzip', zipfilename, "*"], capture_output=True, check=True, cwd=basedir)
-        # crazy hack to ensure mimetype is first when using 7zip
-        if isepub:
-            subprocess_run([SEVENZIP, 'rn', zipfilename, '!mimetype', 'mimetype'], capture_output=True, check=True, cwd=basedir)
     else:
-        zipOutput = ZipFile(zipfilename, 'w', ZIP_STORED)
-        if isepub:
-            zipOutput.writestr('mimetype', 'application/epub+zip', ZIP_STORED)
-        for dirpath, _, filenames in os.walk(basedir):
-            for name in filenames:
-                path = os.path.normpath(os.path.join(dirpath, name))
-                aPath = os.path.normpath(os.path.join(dirpath.replace(basedir, ''), name))
-                if os.path.isfile(path):
-                    zipOutput.write(path, aPath)
-        zipOutput.close()
+        # Write mimetype first without 7z's full-archive rename temporary.
+        with ZipFile(zipfilename, 'w', ZIP_STORED) as zipOutput:
+            if isepub:
+                zipOutput.writestr('mimetype', 'application/epub+zip', ZIP_STORED)
+            for dirpath, _, filenames in os.walk(basedir):
+                for name in filenames:
+                    path = os.path.join(dirpath, name)
+                    aPath = os.path.relpath(path, basedir)
+                    if os.path.isfile(path) and not (isepub and aPath == 'mimetype'):
+                        zipOutput.write(path, aPath)
     end = perf_counter()
     print(f"{job_progress}makeZIP time: {end - start} seconds")
     return zipfilename
@@ -2163,7 +2156,7 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
     else:
         tomes = [path]
     if space_plan is not None:
-        space_plan.after_images(tomes)
+        space_plan.after_images(tomes, cover)
     filepath = []
     tomeNumber = 0
     if GUI:
@@ -2216,7 +2209,7 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
                 buildEPUB(tome, chapterNames, tomeNumber, False, cover, source, job_progress)
                 filepath.append(getOutputFilename(source, options.output, '.epub', ''))
             if space_plan is not None:
-                space_plan.before_zip(tome, filepath[-1], sevenzip=SEVENZIP in available_archive_tools())
+                space_plan.before_zip(tome, filepath[-1])
             makeZIP(filepath[-1], tome, job_progress, True)
         rmtree(tome, True)
         if GUI:

@@ -5,6 +5,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from zipfile import ZipFile, ZIP_STORED
 
 from kindlecomicconverter import comic2ebook as c2e
 
@@ -125,8 +126,8 @@ class SpaceHookTests(unittest.TestCase):
                 c2e.makeBook(str(self.source))
         self.assertEqual(events, ['images check', 'process', 'processed check', 'build', 'zip check'])
         plan.before_images.assert_called_once_with(str(images))
-        plan.after_images.assert_called_once_with([str(work)])
-        plan.before_zip.assert_called_once_with(str(work), str(self.root / 'book.epub'), sevenzip=True)
+        plan.after_images.assert_called_once_with([str(work)], None)
+        plan.before_zip.assert_called_once_with(str(work), str(self.root / 'book.epub'))
         zipped.assert_not_called()
         self.assertTrue(images.exists())
 
@@ -150,11 +151,28 @@ class SpaceHookTests(unittest.TestCase):
             work, images, processing, zipped = self.book_mocks(stack, events)
             with self.assertRaisesRegex(ValueError, 'remaining space'):
                 c2e.makeBook(str(self.source))
-        c2e.space_plan.after_images.assert_called_once_with([str(work)])
+        c2e.space_plan.after_images.assert_called_once_with([str(work)], None)
         processing.assert_called_once()
         self.assertEqual(events, ['process'])
         zipped.assert_not_called()
         self.assertTrue((images / 'page.jpg').exists())
+
+    def test_epub_is_written_once_with_mimetype_first_even_when_sevenzip_is_available(self):
+        work = self.root / 'book'
+        (work / 'OEBPS').mkdir(parents=True)
+        (work / 'OEBPS' / 'page.jpg').write_bytes(b'image bytes')
+        (work / 'mimetype').write_text('application/epub+zip')
+        output = self.root / 'book.epub'
+        with patch.object(c2e, 'available_archive_tools', return_value=[c2e.SEVENZIP]), \
+                patch.object(c2e, 'subprocess_run', side_effect=AssertionError('EPUB must not use 7z')):
+            c2e.makeZIP(str(output), str(work), isepub=True)
+        with ZipFile(output) as archive:
+            self.assertEqual(archive.namelist(), ['mimetype', 'OEBPS/page.jpg'])
+            self.assertEqual(archive.read('mimetype'), b'application/epub+zip')
+            self.assertEqual(archive.read('OEBPS/page.jpg'), b'image bytes')
+            self.assertTrue(all(item.compress_type == ZIP_STORED for item in archive.infolist()))
+            self.assertIsNone(archive.testzip())
+        self.assertFalse((work / '!mimetype').exists())
 
 
 if __name__ == '__main__':
