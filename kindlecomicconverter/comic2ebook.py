@@ -20,6 +20,7 @@
 
 from collections import Counter
 from datetime import datetime
+import importlib.util
 import json
 import os
 import pathlib
@@ -39,7 +40,7 @@ from tempfile import mkdtemp, gettempdir
 from shutil import move, copytree, rmtree
 from multiprocessing import Pool, cpu_count
 from uuid import uuid4
-from natsort import os_sort_keygen, os_sorted
+from natsort import natsort_keygen, ns, os_sort_keygen, os_sorted
 from packaging.version import Version
 from slugify import slugify as slugify_ext
 from PIL import Image, ImageFile, ImageOps
@@ -58,6 +59,7 @@ from . import comicarchive
 from . import pdfjpgextract
 from . import dualmetafix
 from . import metadata
+from .epub_helpers import finalize_epub
 from . import kindle
 from . import i18n
 from . import __version__
@@ -67,13 +69,29 @@ from . import __version__
 # 与主窗口动态文案同 context；CLI 模式下无 QTranslator，返回原文不影响命令行输出。
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 OS_SORT_KEY = os_sort_keygen()
+IMAGE_SORT_KEY = natsort_keygen(alg=ns.FLOAT)
 KF7_KINDLES = ('K1', 'K2', 'K34', 'KDX')
+space_plan = None
 
 # https://www.mobileread.com/forums/showpost.php?p=4213802&postcount=4
 KOBO_TOUCH_DRIVER_REGEX = re.compile(r'[\/\\\?%\*:;\|\"\'><\$!]')
 
 def main(argv=None):
-    global options
+    global options, space_plan
+    space_plan = None
+    plan_path = os.environ.get('CBZ2KEPUB_SPACE_PLAN')
+    module_path = os.environ.get('CBZ2KEPUB_SPACE_MODULE')
+    if bool(plan_path) != bool(module_path):
+        raise ValueError('Both cbz2kepub space plan and module paths are required.')
+    if plan_path:
+        if not Path(plan_path).is_absolute() or not Path(module_path).is_absolute():
+            raise ValueError('cbz2kepub space plan and module paths must be absolute.')
+        spec = importlib.util.spec_from_file_location('cbz2kepub_space_preflight', module_path)
+        if spec is None or spec.loader is None:
+            raise ValueError('Invalid cbz2kepub space module path.')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        space_plan = module.SpacePlan.from_file(plan_path)
     parser = makeParser()
     args = parser.parse_args(argv)
     options = copy(args)
@@ -100,7 +118,7 @@ def main(argv=None):
             options.output = fusion_source_parent
         options = checkOptions(options)
         print('Working on ' + source + '...')
-        makeBook(source, fusion_cover_path)
+        makeBook(source, fusion_cover_path, owned_fusion=options.filefusion)
 
     return 0
 
@@ -657,6 +675,8 @@ def buildEPUB(path, chapternames, tomenumber, ischunked, cover: image.Cover, ori
     buildNCX(path, options.title, chapterlist, chapternames)
     buildNAV(path, options.title, chapterlist, chapternames)
     buildOPF(path, options.title, filelist, originalpath, cover)
+    if options.isKobo and options.format == 'EPUB' and cover is not None:
+        finalize_epub(path, options.series or options.baseTitle, max(1, tomenumber))
 
 
 def buildPDF(path, title, job_progress='', cover=None, output_file=None):
@@ -922,7 +942,25 @@ def mupdf_pdf_process_pages_parallel(filename, output_dir, target_width, target_
 
 
 
-def getWorkFolder(afile, options, workdir=None):
+def getWorkFolder(afile, options, workdir=None, owned_fusion=False):
+    if owned_fusion:
+        if workdir is not None or not os.path.isdir(afile):
+            raise ValueError('Only an owned fusion directory can be consumed.')
+        parent = os.path.dirname(os.path.abspath(afile)) if options.tempdir else gettempdir()
+        if space_plan is None and disk_usage(parent)[2] < getDirectorySize(afile) * 1.2:
+            raise UserWarning(QCoreApplication.translate("KCCGUI", "Not enough disk space to perform conversion."))
+        workdir = mkdtemp('', 'KCC-', parent)
+        fullPath = os.path.join(workdir, 'OEBPS', 'Images')
+        try:
+            os.makedirs(os.path.dirname(fullPath))
+            # rename cannot silently fall back to a cross-volume copy.
+            os.rename(afile, fullPath)
+            sanitizePermissions(fullPath)
+            return workdir
+        except Exception as exc:
+            rmtree(workdir, True)
+            raise UserWarning(QCoreApplication.translate("KCCGUI", "Failed to prepare a workspace.")) from exc
+
     if not workdir:
         if options.tempdir:
             workdir = mkdtemp('', 'KCC-', os.path.dirname(afile))
@@ -950,7 +988,9 @@ def getWorkFolder(afile, options, workdir=None):
             rmtree(workdir, True)
             raise UserWarning(QCoreApplication.translate("KCCGUI", "Failed to prepare a workspace."))
     elif os.path.isfile(afile):
-        if disk_usage(check_path)[2]< os.path.getsize(afile) * 2.5:
+        if space_plan is not None:
+            space_plan.before_extract(afile, fullPath)
+        elif disk_usage(check_path)[2]< os.path.getsize(afile) * 2.5:
             raise UserWarning(DISK_WARNING)
         if afile.lower().endswith('.pdf'):
             if not os.path.exists(fullPath):
@@ -1260,7 +1300,7 @@ def sanitizeTree(filetree, options, prefix='kcc'):
     page = 1
     cover_path = None
     for root, dirs, files in os.walk(filetree):
-        files.sort(key=OS_SORT_KEY)
+        files.sort(key=IMAGE_SORT_KEY)
         for name in files:
             _, ext = getImageFileName(name)
 
@@ -1278,9 +1318,19 @@ def sanitizeTree(filetree, options, prefix='kcc'):
         if os_sorted(dirs) == sorted(dirs):
             is_natural_sorted = True
         dirs.sort(key=OS_SORT_KEY)
-        for i, name in enumerate(dirs):
+        slugs = [slugify(name, options, is_natural_sorted) for name in dirs]
+        if os.name == 'nt' and any(
+                len(os.path.join(root, slug)) + 32 > 220 or any(
+                    len(os.path.join(root, slug, os.path.relpath(os.path.join(child, file), os.path.join(root, name)))) > 220
+                    for child, _, descendants in os.walk(os.path.join(root, name)) for file in descendants)
+                for name, slug in zip(dirs, slugs)):
+            # Shorten all siblings together so later natural sorting keeps their order.
+            short_prefix = 'c'
+            while any(name.casefold().startswith(short_prefix) for name in [*dirs, *chapterNames]):
+                short_prefix = '_' + short_prefix
+            slugs = [f'{short_prefix}{i:04d}' for i in range(1, len(dirs) + 1)]
+        for i, (name, slugified) in enumerate(zip(dirs, slugs)):
             tmpName = name
-            slugified = slugify(name, options, is_natural_sorted)
             while os.path.exists(os.path.join(root, slugified)) and name.upper() != slugified.upper():
                 slugified += "A"
             chapterNames[slugified] = tmpName
@@ -1310,12 +1360,27 @@ def sanitizePermissions(filetree):
     dot_clean(filetree)
 
 
-def chunk_directory(path):
+def chunk_directory(path, chapternames=None):
+    image_path = os.path.join(path, 'OEBPS', 'Images')
+    if os.name == 'nt' and chapternames is not None and any(
+            len(os.path.join(root, name)) > 220 for root, _, files in os.walk(image_path) for name in files):
+        names = {}
+        for index, entry in enumerate(sorted((p for p in Path(image_path).iterdir() if p.is_dir()),
+                                             key=lambda p: OS_SORT_KEY(p.name)), 1):
+            name = f'c{index:04d}'
+            while (entry.parent / name).exists() and entry.name != name:
+                name += 'A'
+            names[name] = chapternames[entry.name]
+            if entry.name != name:
+                entry.rename(entry.parent / name)
+        chapternames.update(names)
     level = -1
-    for root, _, files in os.walk(os.path.join(path, 'OEBPS', 'Images')):
+    for root, _, files in os.walk(image_path):
         for f in files:
             # Windows MAX_LEN = 260 plus some buffer
             if os.name == 'nt' and len(os.path.join(root, f)) > 220:
+                if chapternames is not None:
+                    raise UserWarning('Image paths exceed 220 characters. Use a shorter temporary directory.')
                 flattenTree(os.path.join(path, 'OEBPS', 'Images'))
                 level = 1
                 break               
@@ -1351,13 +1416,42 @@ def chunk_process(path, mode, parent):
     if options.batchsplit == 2 and mode == 2:
         mode = 3
     if options.batchsplit == 1 and mode == 2:
-        with os.scandir(path) as it:
-            for entry in it:
-                if not entry.name.startswith('.') and entry.is_dir():
-                    if getDirectorySize(os.path.join(path, entry)) > targetSize:
-                        flattenTree(path)
-                        mode = 1
-                        break
+        for root, dirs, _ in walkLevel(path, 0):
+            for name in dirs:
+                chapter = os.path.join(root, name)
+                size = getDirectorySize(chapter)
+                if size <= targetSize:
+                    if currentSize and currentSize + size > targetSize:
+                        currentTarget, pathRoot = createNewTome(parent)
+                        output.append(pathRoot)
+                        currentSize = 0
+                    currentSize += size
+                    if path != currentTarget:
+                        move(chapter, os.path.join(currentTarget, name))
+                    continue
+                for _, _, files in walkLevel(chapter, 0):
+                    for filename in files:
+                        if 'below' in filename:
+                            continue
+                        page = [filename]
+                        if 'above' in filename:
+                            page.append(filename.replace('above', 'below'))
+                        size = sum(os.path.getsize(os.path.join(chapter, f)) for f in page)
+                        if size > targetSize:
+                            raise UserWarning('A single processed page exceeds the target size.')
+                        if currentSize and currentSize + size > targetSize:
+                            currentTarget, pathRoot = createNewTome(parent)
+                            output.append(pathRoot)
+                            currentSize = 0
+                        currentSize += size
+                        if path != currentTarget:
+                            destination = os.path.join(currentTarget, name)
+                            os.makedirs(destination, exist_ok=True)
+                            for filename in page:
+                                move(os.path.join(chapter, filename), os.path.join(destination, filename))
+                if not os.listdir(chapter):
+                    os.rmdir(chapter)
+        return output
     if mode < 3:
         for root, dirs, files in walkLevel(path, 0):
             for name in files if mode == 1 else dirs:
@@ -1367,9 +1461,11 @@ def chunk_process(path, mode, parent):
                         size = os.path.getsize(os.path.join(root, name))
                         if 'above' in name:
                             size += os.path.getsize(os.path.join(root, name.replace('above', 'below')))
+                    if size > targetSize:
+                        raise UserWarning('A single processed page exceeds the target size.')
                 else:
                     size = getDirectorySize(os.path.join(root, name))
-                if currentSize + size > targetSize:
+                if currentSize and currentSize + size > targetSize:
                     currentTarget, pathRoot = createNewTome(parent)
                     output.append(pathRoot)
                     currentSize = size
@@ -1882,6 +1978,10 @@ def makeFusion(sources: List[str]):
         # TODO: remove flattenTree when subchapters are supported
         flattenTree(targetpath)   
 
+    book_metadata = first_path.parent / 'ComicInfo.xml'
+    if book_metadata.is_file():
+        shutil.copy2(book_metadata, fusion_path / 'ComicInfo.xml')
+
     end = perf_counter()
     print(f"makefusion: {end - start} seconds")
     print("Combined File: "+ str(fusion_path))
@@ -1889,7 +1989,7 @@ def makeFusion(sources: List[str]):
     return str(fusion_path), fusion_cover_path
 
 
-def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress=''):
+def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_fusion=False):
     start = perf_counter()
     global GUI
     GUI = qtgui
@@ -1901,7 +2001,7 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress=''):
     if not options.filefusion:
         checkPre('LLL-')
     print(f"{job_progress}Preparing source images...")
-    path = getWorkFolder(source, options)
+    path = getWorkFolder(source, options, owned_fusion=owned_fusion)
     print(f"{job_progress}Checking images...")
     _, ext = os.path.splitext(source)
 
@@ -1932,7 +2032,25 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress=''):
         
         return [output_file]
 
-    getMetadata(os.path.join(path, "OEBPS", "Images"), source)
+    images_path = Path(path) / 'OEBPS' / 'Images'
+    book_metadata = Path(source).parent / 'ComicInfo.xml'
+    if Path(source).is_file() and book_metadata.is_file():
+        target = images_path / 'ComicInfo.xml'
+        book = ET.parse(book_metadata)
+        if target.is_file():
+            try:
+                embedded = ET.parse(target)
+            except ET.ParseError:
+                pass
+            else:
+                for field in book.getroot():
+                    for old in list(embedded.getroot()):
+                        if old.tag == field.tag:
+                            embedded.getroot().remove(old)
+                    embedded.getroot().append(field)
+                book = embedded
+        book.write(target, encoding='utf-8', xml_declaration=True)
+    getMetadata(str(images_path), source)
     removeNonImages(os.path.join(path, "OEBPS", "Images"))
     detectSuboptimalProcessing(os.path.join(path, "OEBPS", "Images"), source)
     chapterNames, cover_path = sanitizeTree(os.path.join(path, 'OEBPS', 'Images'), options)
@@ -2035,13 +2153,17 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress=''):
         print(f"{job_progress}Processing images...")
         if GUI:
             GUI.progressBarTick.emit(f'{job_progress}Processing images')
+        if space_plan is not None:
+            space_plan.before_images(os.path.join(path, 'OEBPS', 'Images'))
         imgDirectoryProcessing(os.path.join(path, "OEBPS", "Images"), job_progress)
     if GUI:
         GUI.progressBarTick.emit('1')
     if options.batchsplit > 0 or options.targetsize:
-        tomes = chunk_directory(path)
+        tomes = chunk_directory(path, chapterNames)
     else:
         tomes = [path]
+    if space_plan is not None:
+        space_plan.after_images(tomes)
     filepath = []
     tomeNumber = 0
     if GUI:
@@ -2093,6 +2215,8 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress=''):
             else:
                 buildEPUB(tome, chapterNames, tomeNumber, False, cover, source, job_progress)
                 filepath.append(getOutputFilename(source, options.output, '.epub', ''))
+            if space_plan is not None:
+                space_plan.before_zip(tome, filepath[-1], sevenzip=SEVENZIP in available_archive_tools())
             makeZIP(filepath[-1], tome, job_progress, True)
         rmtree(tome, True)
         if GUI:
