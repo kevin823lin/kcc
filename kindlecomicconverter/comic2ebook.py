@@ -55,6 +55,7 @@ from .shared import IMAGE_TYPES, getImageFileName, walkSort, walkLevel, sanitize
 from .comicarchive import SEVENZIP, available_archive_tools
 from . import comic2panel
 from . import image
+from . import chapter_pairing
 from . import comicarchive
 from . import pdfjpgextract
 from . import dualmetafix
@@ -72,6 +73,8 @@ OS_SORT_KEY = os_sort_keygen()
 IMAGE_SORT_KEY = natsort_keygen(alg=ns.FLOAT)
 KF7_KINDLES = ('K1', 'K2', 'K34', 'KDX')
 space_plan = None
+pairing_plan = None
+pairing_output = {}
 
 # https://www.mobileread.com/forums/showpost.php?p=4213802&postcount=4
 KOBO_TOUCH_DRIVER_REGEX = re.compile(r'[\/\\\?%\*:;\|\"\'><\$!]')
@@ -676,7 +679,12 @@ def buildEPUB(path, chapternames, tomenumber, ischunked, cover: image.Cover, ori
     buildNAV(path, options.title, chapterlist, chapternames)
     buildOPF(path, options.title, filelist, originalpath, cover)
     if options.isKobo and options.format == 'EPUB' and cover is not None:
-        finalize_epub(path, options.series or options.baseTitle, max(1, tomenumber))
+        if pairing_plan is None:
+            finalize_epub(path, options.series or options.baseTitle, max(1, tomenumber))
+        else:
+            pairing_plan['pages'].extend(finalize_epub(
+                path, options.series or options.baseTitle, max(1, tomenumber),
+                pairing_plan=pairing_plan, pairing_output=pairing_output))
 
 
 def buildPDF(path, title, job_progress='', cover=None, output_file=None):
@@ -708,11 +716,63 @@ def buildPDF(path, title, job_progress='', cover=None, output_file=None):
     return output_file
 
 
+def analyzeChapterPairing(images_path, chapter_names, source, job_progress=''):
+    start = perf_counter()
+    chapters = {}
+    for path in Path(images_path).rglob('*'):
+        if not path.is_file():
+            continue
+        match = re.fullmatch(r'kcc-(\d+)', path.stem)
+        if match is None:
+            raise ValueError('Chapter pairing requires sanitized source image IDs: ' + path.name)
+        if options.filefusion:
+            relative = path.relative_to(images_path)
+            if len(relative.parts) < 2:
+                raise ValueError('Fusion chapter images must be inside a chapter directory')
+            key = relative.parts[0]
+            title = chapter_names[key]
+        else:
+            key, title = '', Path(source).stem
+        chapters.setdefault(key, (title, []))[1].append((int(match[1]), str(path)))
+    report = chapter_pairing.analyze_chapters(
+        list(chapters.values()), options.profileData[1],
+        'rtl' if options.righttoleft else 'ltr', options.spreadshift)
+    print(f'{job_progress}chapterPairingAnalysis: {perf_counter() - start} seconds')
+    for chapter in report['chapters']:
+        layout = '1 | 23 | 45' if chapter['spreadshift'] else '12 | 34 | 56'
+        if chapter['mode'] == 'native':
+            decision = 'native (wide or square source image)'
+        elif chapter['anchor']:
+            anchor = chapter['anchor']
+            first = anchor['source_ids'][0] - chapter['source_ids'][0] + 1
+            decision = f'{layout} (chapter pages {first}/{first + 1}, RGB distance {anchor["score"]:.2f})'
+        else:
+            decision = f'{layout} (configured spreadshift)'
+        print(f'{job_progress}Chapter pairing [{chapter["title"]}]: {decision}')
+    return report
+
+
+def writePairingReport():
+    report_path = os.environ.get('CBZ2KEPUB_PAIRING_REPORT')
+    if not report_path:
+        return
+    path = Path(report_path)
+    if not path.is_absolute():
+        raise ValueError('Chapter pairing report path must be absolute')
+    temporary = path.with_name(path.name + '.tmp')
+    data = json.dumps(pairing_plan, ensure_ascii=False).encode('utf-8')
+    if space_plan is not None:
+        space_plan.before_pairing_report(path, len(data))
+    temporary.write_bytes(data)
+    os.replace(temporary, path)
+
+
 def imgDirectoryProcessing(path, job_progress=''):
-    global workerPool, workerOutput
+    global workerPool, workerOutput, pairing_output
     workerPool = Pool(maxtasksperchild=100)
     workerOutput = []
     options.imgMetadata = {}
+    pairing_output = {}
     work = []
     pagenumber = 0
     is_first_page = True
@@ -722,12 +782,24 @@ def imgDirectoryProcessing(path, job_progress=''):
             work.append([afile, dirpath, options, is_first_page])
             if is_first_page:
                 is_first_page = False
+    if pairing_plan is not None:
+        by_source = {int(re.fullmatch(r'kcc-(\d+)', Path(item[0]).stem)[1]): item for item in work}
+        grouped = []
+        for group in pairing_plan['groups']:
+            entries = [by_source[source_id] for source_id in group['source_ids']]
+            if group['mode'] == 'paired':
+                grouped.append((imgPairProcessing, (entries, group['id'], group['source_ids'])))
+            else:
+                entries[0].append(dict(source_id=group['source_ids'][0], group_id=group['id']))
+                grouped.append((imgFileProcessing, entries[0]))
+    else:
+        grouped = [(imgFileProcessing, item) for item in work]
     if GUI:
         GUI.progressBarTick.emit(str(pagenumber))
     if len(work) > 0:
         img_processing_start = perf_counter()
-        for i in work:
-            workerPool.apply_async(func=imgFileProcessing, args=(i,), callback=imgFileProcessingTick)
+        for function, i in grouped:
+            workerPool.apply_async(func=function, args=(i,), callback=imgFileProcessingTick)
         workerPool.close()
         workerPool.join()
         img_processing_end = perf_counter()
@@ -755,6 +827,8 @@ def imgFileProcessingTick(output):
         for page in output:
             if page is not None:
                 options.imgMetadata[page[0]] = page[1]
+                if len(page) > 2:
+                    pairing_output[page[0]] = dict(source_id=page[2], group_id=page[3], geometry=page[4])
     if GUI:
         GUI.progressBarTick.emit('tick')
         if not GUI.conversionAlive:
@@ -771,27 +845,63 @@ def imgFileProcessing(work):
         workImg = image.ComicPageParser((dirpath, afile), is_first_page, opt)
         for i in workImg.payload:
             img = image.ComicPage(opt, *i)
-            img.gammaCorrectImage()
+            page = processImagePage(img)
+            if len(work) > 4:
+                page.extend([work[4]['source_id'], work[4]['group_id'], None])
+            output.append(page)
+        return output
+    except Exception:
+        return str(sys.exc_info()[1]), sanitizeTrace(sys.exc_info()[2])
 
-            if not img.colorOutput:
-                img.convertToGrayscale()
 
-            img.autocontrastImage()
-            img.resizeImage()
-            img.optimizeForDisplay(opt.eraserainbow, img.colorOutput)
+def processImagePage(img, geometry=None, method=None):
+    """Preserve native filters/encoding, replacing only paired page fitting."""
+    opt = img.opt
+    img.gammaCorrectImage()
+    if not img.colorOutput:
+        img.convertToGrayscale()
+    img.autocontrastImage()
+    if geometry is None:
+        img.resizeImage()
+    else:
+        img.image = img.image.resize(geometry['rendered_size'], method)
+    img.optimizeForDisplay(opt.eraserainbow, img.colorOutput)
+    if geometry is not None:
+        canvas = Image.new(img.image.mode, opt.profileData[1], img.fill)
+        canvas.paste(img.image, tuple(geometry['offset']))
+        img.image = canvas
+    if not img.colorOutput and opt.forcepng:
+        if not opt.noquantize:
+            img.quantizeImage()
+        if opt.format == 'PDF' or (opt.profile in KF7_KINDLES and opt.format == 'CBZ') or opt.pnglegacy:
+            img.convertToGrayscale()
+    return img.saveToDir()
 
-            if img.colorOutput:
-                pass
-            elif opt.forcepng:
-                if not opt.noquantize:
-                    img.quantizeImage()
-                if opt.format == 'PDF':
-                    img.convertToGrayscale()
-                elif opt.profile in KF7_KINDLES and opt.format == 'CBZ':
-                    img.convertToGrayscale()
-                elif opt.pnglegacy:
-                    img.convertToGrayscale()
-            output.append(img.saveToDir())
+
+def imgPairProcessing(work):
+    try:
+        entries, group_id, source_ids = work
+        opt = entries[0][2]
+        parsers = [image.ComicPageParser((entry[1], entry[0]), entry[3], opt, defer_processing=True)
+                   for entry in entries]
+        direction = 'rtl' if opt.righttoleft else 'ltr'
+        geometries = chapter_pairing.pair_geometry(
+            [parser.image.size for parser in parsers], [parser.crop_box for parser in parsers],
+            opt.profileData[1], direction, opt.upscale)
+        methods = [chapter_pairing.resize_method(g['crop_box'], g['rendered_size']) for g in geometries]
+        method = Image.Resampling.LANCZOS if Image.Resampling.LANCZOS in methods else Image.Resampling.BICUBIC
+        output = []
+        for source_id, geometry in zip(source_ids, geometries):
+            parser = parsers.pop(0)
+            cropped = parser.image.crop(geometry['crop_box'])
+            parser.image.close()
+            img = image.ComicPage(opt, 'N', parser.source, cropped, parser.page_background_color, parser.fill)
+            cropped.close()
+            page = processImagePage(img, geometry, method)
+            page.extend([source_id, group_id, geometry])
+            output.append(page)
+            img.image.close()
+            del img, parser
         return output
     except Exception:
         return str(sys.exc_info()[1]), sanitizeTrace(sys.exc_info()[2])
@@ -1403,6 +1513,18 @@ def chunk_directory(path, chapternames=None):
         raise UserWarning(QCoreApplication.translate("KCCGUI", 'Unsupported directory structure.'))
 
 
+def processedPageGroups(files):
+    """Keep paired sources and native above/below resources indivisible."""
+    paired_ids = {group['id'] for group in pairing_plan['groups'] if group['mode'] == 'paired'} if pairing_plan else set()
+    groups = {}
+    for filename in files:
+        page = pairing_output.get(filename)
+        key = (('paired', page['group_id']) if page and page['group_id'] in paired_ids
+               else ('native', filename.replace('below', 'above')))
+        groups.setdefault(key, []).append(filename)
+    return list(groups.values())
+
+
 def chunk_process(path, mode, parent):
     output = []
     currentSize = 0
@@ -1413,6 +1535,14 @@ def chunk_process(path, mode, parent):
         targetSize = 104857600
     else:
         targetSize = 419430400
+    if pairing_plan:
+        paired_ids = {group['id'] for group in pairing_plan['groups'] if group['mode'] == 'paired'}
+        for root, _, files in os.walk(path):
+            for page in processedPageGroups(files):
+                metadata = pairing_output.get(page[0])
+                if metadata and metadata['group_id'] in paired_ids:
+                    if sum(os.path.getsize(os.path.join(root, name)) for name in page) > targetSize:
+                        raise UserWarning('A single processed paired group exceeds the target size.')
     if options.batchsplit == 2 and mode == 2:
         mode = 3
     if options.batchsplit == 1 and mode == 2:
@@ -1430,15 +1560,10 @@ def chunk_process(path, mode, parent):
                         move(chapter, os.path.join(currentTarget, name))
                     continue
                 for _, _, files in walkLevel(chapter, 0):
-                    for filename in files:
-                        if 'below' in filename:
-                            continue
-                        page = [filename]
-                        if 'above' in filename:
-                            page.append(filename.replace('above', 'below'))
+                    for page in processedPageGroups(files):
                         size = sum(os.path.getsize(os.path.join(chapter, f)) for f in page)
                         if size > targetSize:
-                            raise UserWarning('A single processed page exceeds the target size.')
+                            raise UserWarning('A single processed page or paired group exceeds the target size.')
                         if currentSize and currentSize + size > targetSize:
                             currentTarget, pathRoot = createNewTome(parent)
                             output.append(pathRoot)
@@ -1454,17 +1579,13 @@ def chunk_process(path, mode, parent):
         return output
     if mode < 3:
         for root, dirs, files in walkLevel(path, 0):
-            for name in files if mode == 1 else dirs:
-                size = 0
-                if mode == 1: 
-                    if 'below' not in name:
-                        size = os.path.getsize(os.path.join(root, name))
-                        if 'above' in name:
-                            size += os.path.getsize(os.path.join(root, name.replace('above', 'below')))
+            for page in processedPageGroups(files) if mode == 1 else [[name] for name in dirs]:
+                if mode == 1:
+                    size = sum(os.path.getsize(os.path.join(root, name)) for name in page)
                     if size > targetSize:
-                        raise UserWarning('A single processed page exceeds the target size.')
+                        raise UserWarning('A single processed page or paired group exceeds the target size.')
                 else:
-                    size = getDirectorySize(os.path.join(root, name))
+                    size = getDirectorySize(os.path.join(root, page[0]))
                 if currentSize and currentSize + size > targetSize:
                     currentTarget, pathRoot = createNewTome(parent)
                     output.append(pathRoot)
@@ -1472,7 +1593,8 @@ def chunk_process(path, mode, parent):
                 else:
                     currentSize += size
                 if path != currentTarget:
-                    move(os.path.join(root, name), os.path.join(currentTarget, name))
+                    for name in page:
+                        move(os.path.join(root, name), os.path.join(currentTarget, name))
     else:
         firstTome = True
         for root, dirs, _ in walkLevel(path, 0):
@@ -1633,6 +1755,8 @@ def makeParser():
     output_options.add_argument("-b", "--batchsplit", type=int, dest="batchsplit", default="0",
                                 help="Split output into multiple files. 0: Don't split 1: Automatic mode "
                                      "2: Consider every subdirectory as separate volume [Default=0]")
+    output_options.add_argument("--chapter-pairing", action="store_true", dest="chapter_pairing", default=False,
+                                help="Detect chapter pairing and use common crop geometry (Kobo EPUB only)")
     output_options.add_argument("--spreadshift", action="store_true", dest="spreadshift", default=False,
                                 help="Shift first page to opposite side in landscape for spread alignment")
     output_options.add_argument("--onepagelandscape", action="store_true", dest="onepagelandscape", default=False,
@@ -1775,6 +1899,15 @@ def checkOptions(options):
             options.format = 'PDF'
         else:
             options.format = 'EPUB'
+
+    if getattr(options, 'chapter_pairing', False):
+        if options.profile not in image.ProfileData.ProfilesKobo or options.format != 'EPUB':
+            raise UserWarning('Chapter pairing requires a Kobo profile and EPUB output.')
+        conflicts = ('noprocessing', 'onepagelandscape', 'interpanelcrop', 'webtoon', 'stretch',
+                     'wallpaper', 'maximizestrips', 'lightnovel', 'invertdirection', 'vertical4panel')
+        enabled = [name for name in conflicts if getattr(options, name, False)]
+        if enabled:
+            raise UserWarning('Chapter pairing is incompatible with: ' + ', '.join(enabled))
 
     if options.white_borders:
         options.bordersColor = 'white'
@@ -1984,7 +2117,13 @@ def makeFusion(sources: List[str]):
 
 def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_fusion=False):
     start = perf_counter()
-    global GUI
+    global GUI, pairing_plan, pairing_output
+    pairing_plan = None
+    pairing_output = {}
+    if getattr(options, 'chapter_pairing', False):
+        pairing_plan = chapter_pairing.analyze_chapters(
+            [], options.profileData[1], 'rtl' if options.righttoleft else 'ltr', options.spreadshift)
+        writePairingReport()
     GUI = qtgui
     if GUI:
         GUI.progressBarTick.emit('1')
@@ -2048,6 +2187,8 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
     detectSuboptimalProcessing(os.path.join(path, "OEBPS", "Images"), source)
     chapterNames, cover_path = sanitizeTree(os.path.join(path, 'OEBPS', 'Images'), options)
 
+    if getattr(options, 'chapter_pairing', False) and os.path.exists(source + '.json'):
+        raise UserWarning('Chapter pairing is incompatible with source spread JSON.')
     if os.path.exists(source+'.json'):
         flattenTree(os.path.join(path, 'OEBPS', 'Images'))
         chapterNames = {}
@@ -2078,6 +2219,10 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
         # Strip the fusion_0001_ sort prefix from makeFusion if present
         chapterNames = {k: sub(r'^fusion_\d{4}_', '', v) for k, v in chapterNames.items()}
 
+    if getattr(options, 'chapter_pairing', False):
+        pairing_plan = analyzeChapterPairing(images_path, chapterNames, source, job_progress)
+        writePairingReport()
+
     source_path = Path(source)
     options.customcover = False
     if source_path.parent.joinpath('Covers').is_dir():
@@ -2102,6 +2247,12 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
     cover = None
     if not options.webtoon or options.customcover:
         cover = image.Cover(cover_path, options)
+
+    if (pairing_plan is not None and not options.filefusion and Path(source).suffix.lower() == '.cbz'
+            and pairing_plan['chapters'][0]['mode'] == 'paired'):
+        # A CBZ is one chapter, even when a pair crosses its nested directories.
+        flattenTree(str(images_path))
+        chapterNames = {}
 
     x, y = image.ProfileData.Profiles[options.profile][1]
     if options.webtoon:
@@ -2247,6 +2398,10 @@ def makeBook(source, fusion_cover_path=None, qtgui=None, job_progress='', owned_
     if options.filefusion:
         rmtree(source, True)
         checkPre('LLL-')
+
+    if pairing_plan is not None:
+        pairing_plan['state'] = 'completed'
+        writePairingReport()
 
     return filepath
 

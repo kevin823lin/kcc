@@ -2,6 +2,7 @@
 
 from io import BytesIO
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 from PIL import Image
@@ -20,7 +21,7 @@ ET.register_namespace("dc", "http://purl.org/dc/elements/1.1/")
 ET.register_namespace("epub", EPUB)
 
 
-def finalize_epub(path, series_name, series_index):
+def finalize_epub(path, series_name, series_index, *, pairing_plan=None, pairing_output=None):
     """Finish a freshly generated KCC EPUB before its first ZIP packaging."""
     if not isinstance(series_name, str) or not series_name.strip() or type(series_index) is not int or series_index < 1:
         raise ValueError("A series name and positive integer series index are required")
@@ -89,6 +90,10 @@ def finalize_epub(path, series_name, series_index):
         "width": str(width), "height": str(height), "preserveAspectRatio": "xMidYMid meet",
         "href": '../Images/cover.jpg', "{http://www.w3.org/1999/xlink}href": '../Images/cover.jpg'})
 
+    pages = []
+    if pairing_plan is not None:
+        pages = finalize_pairing(root, package, pairing_plan, pairing_output, series_index)
+
     # ElementTree drops declarations used only inside property values or text.
     serialized = ET.tostring(package, encoding="utf-8")
     emitted = dict(value for event, value in ET.iterparse(BytesIO(serialized), events=("start-ns",)))
@@ -100,3 +105,68 @@ def finalize_epub(path, series_name, series_index):
     cover_path.parent.mkdir(parents=True, exist_ok=True)
     cover_path.write_bytes(cover_bytes)
     opf_path.write_bytes(opf_bytes)
+    return pages
+
+
+def finalize_pairing(root, package, plan, processed, tome):
+    """Read actual spine resources and change only paired-chapter page sides."""
+    opf_root = root / 'OEBPS'
+    manifest = {item.get('id'): item for item in package.find('opf:manifest', NS)}
+    groups = {group['id']: group for group in plan['groups']}
+    pages = []
+    for reference in package.find('opf:spine', NS):
+        if reference.get('idref') == COVER_ID:
+            continue
+        item = manifest[reference.get('idref')]
+        xhtml_path = (opf_root / item.get('href')).resolve()
+        html = ET.parse(xhtml_path).getroot()
+        viewport = None
+        for meta in html.findall(f'.//{{{XHTML}}}meta'):
+            if meta.get('name') == 'viewport':
+                values = dict(re.findall(r'(width|height)\s*=\s*(\d+)', meta.get('content', '')))
+                if 'width' in values and 'height' in values:
+                    viewport = [int(values['width']), int(values['height'])]
+        images = []
+        for node in html.iter():
+            if node.tag == f'{{{XHTML}}}img':
+                href = node.get('src')
+            elif node.tag == f'{{{SVG}}}image':
+                href = node.get('href') or node.get('{http://www.w3.org/1999/xlink}href')
+            else:
+                continue
+            image_path = (xhtml_path.parent / href).resolve()
+            metadata = processed.get(image_path.name)
+            if metadata is None:
+                raise ValueError('Missing chapter pairing output for ' + image_path.name)
+            images.append((image_path, metadata))
+        if not images:
+            raise ValueError('Chapter pairing body XHTML has no images')
+        group_ids = {metadata['group_id'] for _, metadata in images}
+        if len(group_ids) != 1:
+            raise ValueError('Body XHTML crosses chapter pairing groups')
+        group = groups[next(iter(group_ids))]
+        if group['mode'] != 'native':
+            if len(images) != 1:
+                raise ValueError('Paired chapter pages require one image per XHTML')
+            if group['mode'] == 'single':
+                side = 'center'
+            else:
+                first = images[0][1]['source_id'] == group['source_ids'][0]
+                side = 'right' if first == (plan['direction'] == 'rtl') else 'left'
+            properties = [value for value in reference.get('properties', '').split()
+                          if not value.removeprefix('rendition:').startswith('page-spread-')]
+            reference.set('properties', ' '.join([*properties, 'rendition:page-spread-' + side]))
+        sides = [side for side in ('left', 'right', 'center')
+                 if any(value.removeprefix('rendition:') == 'page-spread-' + side
+                        for value in reference.get('properties', '').split())]
+        if len(sides) != 1:
+            raise ValueError('Body page requires one final page-spread side')
+        for image_path, metadata in images:
+            with Image.open(image_path) as image:
+                image_size = list(image.size)
+            pages.append(dict(
+                source_id=metadata['source_id'], group_id=metadata['group_id'],
+                image=image_path.relative_to(root).as_posix(), xhtml=xhtml_path.relative_to(root).as_posix(),
+                tome=tome, side=sides[0], image_size=image_size, viewport=viewport,
+                geometry=metadata['geometry']))
+    return pages

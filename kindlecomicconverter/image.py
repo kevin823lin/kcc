@@ -171,12 +171,13 @@ class ProfileData:
 
 
 class ComicPageParser:
-    def __init__(self, source, is_first_page, options):
+    def __init__(self, source, is_first_page, options, defer_processing=False):
         Image.MAX_IMAGE_PIXELS = int(2048 * 2048 * 2048 // 4 // 3)
         self.opt = options
         self.source = source
         self.size = self.opt.profileData[1]
         self.payload = []
+        self.defer_processing = defer_processing
 
         # Detect corruption in source image, let caller catch any exceptions triggered.
         srcImgPath = os.path.join(source[0], source[1])
@@ -190,6 +191,7 @@ class ComicPageParser:
             self.image = Image.fromarray(array)
         
         self.original_color_mode = self.image.mode
+        self.crop_box = (0, 0, *self.image.size)
 
         self.page_background_color = self.fillCheck()
         self.fill = self.page_background_color
@@ -209,7 +211,8 @@ class ComicPageParser:
             if self.opt.interpanelcrop > 0:
                 self.cropInterPanelEmptySections("horizontal" if self.opt.interpanelcrop == 1 else "both")
 
-        self.splitCheck()
+        if not defer_processing:
+            self.splitCheck()
 
     def getImageHistogram(self, image):
         histogram = image.histogram()
@@ -326,7 +329,9 @@ class ComicPageParser:
         box_area = (box[2] - box[0]) * (box[3] - box[1])
         image_area = self.image.size[0] * self.image.size[1]
         if (box_area / image_area) >= minimum:
-            self.image = self.image.crop(box)
+            self.crop_box = box
+            if not self.defer_processing:
+                self.image = self.image.crop(box)
 
     def cropPageNumber(self, power, minimum):
         bbox = get_bbox_crop_margin_page_number(self.image, power, self.page_background_color)

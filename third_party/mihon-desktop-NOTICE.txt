@@ -1,0 +1,8 @@
+Mihon Desktop contributors
+SharedSpreadMatching.kt, revision 3d7652e30698508aa0c17798104037708d879b02
+https://github.com/AltairCardinal/mihon-desktop/blob/3d7652e30698508aa0c17798104037708d879b02/domain/src/commonMain/kotlin/mihon/domain/reader/SharedSpreadMatching.kt
+Licensed under Apache License 2.0; see Apache-2.0.txt.
+
+kindlecomicconverter/chapter_pairing.py adapts only edge sampling and scoring.
+Changes: Python/Pillow implementation, source orientation, chapter first-match
+selection instead of reader state management, and common crop geometry.
