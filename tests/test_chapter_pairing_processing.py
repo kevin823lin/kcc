@@ -8,9 +8,18 @@ from PIL import Image, ImageDraw
 
 from kindlecomicconverter import comic2ebook as c2e
 from kindlecomicconverter import image as image_module
+from kindlecomicconverter.page_number_crop_alg import ignore_pixels_near_edge
 
 
 class PairingProcessingTests(unittest.TestCase):
+    def test_empty_inner_sample_on_small_scan_preserves_body_pixels(self):
+        for size in ((160, 240), (240, 160)):
+            with self.subTest(size=size):
+                bitmap = Image.new('L', size)
+                bitmap.putpixel((80, 80), 255)
+                ignore_pixels_near_edge(bitmap)
+                self.assertEqual(bitmap.getbbox(), (80, 80, 81, 81))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

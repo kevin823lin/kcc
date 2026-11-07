@@ -172,6 +172,8 @@ def ignore_pixels_near_edge(bw_img: Image):
     ]
 
     for edge_box, inner_box in zip(edge_bbox, inner_bbox):
+        if inner_box[0] == inner_box[2] or inner_box[1] == inner_box[3]:
+            continue
         inner_edge = bw_img.crop(inner_box)
         h = inner_edge.histogram()
         imperfections = h[255] / (inner_edge.height * inner_edge.width)
