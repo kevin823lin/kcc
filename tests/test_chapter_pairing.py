@@ -156,29 +156,27 @@ class GeometryTests(unittest.TestCase):
     def test_normalized_vertical_union_and_preserved_inner_and_outer_sides(self):
         geometry = pair_geometry([(100, 300), (120, 500)],
                                  [(4.5, 31, 96.1, 270), (7.1, 49, 113.2, 451)],
-                                 [150, 400], 'rtl')
+                                 [150, 400])
         self.assertEqual([g['crop_box'] for g in geometry], [[4, 29, 97, 271], [7, 49, 114, 451]])
         self.assertEqual([g['rendered_size'][1] for g in geometry], [390, 390])
-        self.assertEqual(geometry[0]['offset'], [0, 5])
-        self.assertEqual(geometry[1]['offset'], [47, 5])
+        self.assertEqual([g['rendered_size'][0] for g in geometry], [149, 103])
+        self.assertTrue(all(set(g) == {'crop_box', 'rendered_size'} for g in geometry))
 
     def test_no_upscale_uses_smallest_cropped_height(self):
         for upscale, expected in ((False, 100), (True, 300)):
             geometry = pair_geometry([(50, 100), (100, 200)], [(0, 0, 50, 100), (0, 0, 100, 200)],
-                                     [200, 300], 'ltr', upscale)
+                                     [200, 300], upscale)
             self.assertEqual([g['rendered_size'] for g in geometry], [[expected // 2, expected]] * 2)
-            self.assertEqual(geometry[0]['offset'][0], 200 - expected // 2)
-            self.assertEqual(geometry[1]['offset'][0], 0)
 
     def test_exact_fraction_boundaries_and_full_source_candidates(self):
-        geometry = pair_geometry([(100, 300), (100, 300)], [(0, 29, 100, 271)] * 2, [100, 300], 'rtl')
+        geometry = pair_geometry([(100, 300), (100, 300)], [(0, 29, 100, 271)] * 2, [100, 300])
         self.assertEqual(geometry[0]['crop_box'], [0, 29, 100, 271])
         self.assertEqual(geometry[0]['rendered_size'], [100, 242])
-        full = pair_geometry([(100, 200)] * 2, [(0, 0, 100, 200)] * 2, [100, 200], 'rtl')
-        self.assertEqual(full[0], dict(crop_box=[0, 0, 100, 200], rendered_size=[100, 200], offset=[0, 0]))
+        full = pair_geometry([(100, 200)] * 2, [(0, 0, 100, 200)] * 2, [100, 200])
+        self.assertEqual(full[0], dict(crop_box=[0, 0, 100, 200], rendered_size=[100, 200]))
 
     def test_minimum_width_and_resize_filter(self):
-        geometry = pair_geometry([(1, 1000)] * 2, [(0, 0, 1, 1000)] * 2, [100, 100], 'rtl')
+        geometry = pair_geometry([(1, 1000)] * 2, [(0, 0, 1, 1000)] * 2, [100, 100])
         self.assertEqual(geometry[0]['rendered_size'], [1, 100])
         self.assertEqual(resize_method([0, 0, 1, 1000], [1, 100]), Image.Resampling.LANCZOS)
         self.assertEqual(resize_method([0, 0, 100, 200], [100, 200]), Image.Resampling.BICUBIC)
@@ -187,9 +185,9 @@ class GeometryTests(unittest.TestCase):
     def test_bad_crop_and_unrenderable_target_rejected(self):
         for box in ((-1, 0, 10, 20), (0, 0, 11, 20), (0, 10, 10, 10)):
             with self.assertRaises(ValueError):
-                pair_geometry([(10, 20)] * 2, [box] * 2, [10, 20], 'rtl')
+                pair_geometry([(10, 20)] * 2, [box] * 2, [10, 20])
         with self.assertRaises(ValueError):
-            pair_geometry([(100, 1)] * 2, [(0, 0, 100, 1)] * 2, [1, 1], 'rtl')
+            pair_geometry([(100, 1)] * 2, [(0, 0, 100, 1)] * 2, [1, 1])
 
 
 if __name__ == '__main__':

@@ -86,15 +86,16 @@ class PairingEpubTests(unittest.TestCase):
         processed = {}
         for source_id in range(1, 6):
             basename = f'kcc-{source_id:04d}-kcc-x'
-            Image.new('RGB', (100, 160), 'gray').save(images / (basename + '.jpg'))
+            width = {1: 96, 2: 64}.get(source_id, 100)
+            Image.new('RGB', (width, 160), 'gray').save(images / (basename + '.jpg'))
             (text / (basename + '.xhtml')).write_text(
-                f'<html xmlns="{XHTML}"><head><meta name="viewport" content="width=100, height=160"/></head>'
+                f'<html xmlns="{XHTML}"><head><meta name="viewport" content="width={width}, height=160"/></head>'
                 f'<body><img src="../Images/{basename}.jpg"/></body></html>', encoding='utf-8')
             manifest.append(f'<item id="p{source_id}" href="Text/{basename}.xhtml" media-type="application/xhtml+xml"/>')
             references.append(f'<itemref idref="p{source_id}" properties="rendition:page-spread-left custom:keep"/>')
             group_id = 1 if source_id < 3 else source_id - 1
             processed[basename + '.jpg'] = dict(source_id=source_id, group_id=group_id,
-                geometry=dict(crop_box=[0, 0, 100, 160], rendered_size=[100, 160], offset=[0, 0]) if source_id < 3 else None)
+                geometry=dict(crop_box=[0, 0, width, 160], rendered_size=[width, 160]) if source_id < 3 else None)
         opf = work / 'OEBPS/content.opf'
         opf.write_text(f'<package xmlns="{OPF}" xmlns:custom="urn:custom"><metadata/>'
                        f'<manifest>{"".join(manifest)}</manifest><spine page-progression-direction="{direction}">'
@@ -125,7 +126,8 @@ class PairingEpubTests(unittest.TestCase):
                 self.assertEqual([page['side'] for page in pages], expected + ['center', 'left', 'left'])
                 self.assertEqual([page['source_id'] for page in pages], [1, 2, 3, 4, 5])
                 self.assertEqual([page['tome'] for page in pages], [2] * 5)
-                self.assertTrue(all(page['image_size'] == [100, 160] and page['viewport'] == [100, 160] for page in pages))
+                self.assertEqual([page['image_size'] for page in pages], [[96, 160], [64, 160]] + [[100, 160]] * 3)
+                self.assertTrue(all(page['image_size'] == page['viewport'] for page in pages))
                 self.assertEqual(pages[0]['image'], 'OEBPS/Images/kcc-0001-kcc-x.jpg')
                 self.assertEqual(pages[0]['xhtml'], 'OEBPS/Text/kcc-0001-kcc-x.xhtml')
                 self.assertTrue(all('custom:keep' in reference.get('properties', '') for reference in list(spine)[1:]))
@@ -133,7 +135,7 @@ class PairingEpubTests(unittest.TestCase):
                 self.assertEqual(len(pages), 5)
 
     def test_parent_report_writes_atomically_and_requires_absolute_path(self):
-        c2e.pairing_plan = dict(version=1, state='analyzing', pages=[])
+        c2e.pairing_plan = dict(version=2, state='analyzing', pages=[])
         report = self.root / 'pairing.json'
         with patch.dict(os.environ, {'CBZ2KEPUB_PAIRING_REPORT': str(report)}), \
                 patch.object(c2e.os, 'replace', wraps=os.replace) as replace:
@@ -146,7 +148,7 @@ class PairingEpubTests(unittest.TestCase):
                 c2e.writePairingReport()
 
     def test_report_capacity_hook_receives_actual_encoded_bytes_before_write(self):
-        c2e.pairing_plan = dict(version=1, state='analyzing', chapters=[dict(title='測試')])
+        c2e.pairing_plan = dict(version=2, state='analyzing', chapters=[dict(title='測試')])
         path = self.root / 'pairing.json'
         observed = []
         def check(destination, size):

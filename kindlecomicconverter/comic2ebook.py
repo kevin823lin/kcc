@@ -790,7 +790,7 @@ def imgDirectoryProcessing(path, job_progress=''):
             if group['mode'] == 'paired':
                 grouped.append((imgPairProcessing, (entries, group['id'], group['source_ids'])))
             else:
-                entries[0].append(dict(source_id=group['source_ids'][0], group_id=group['id']))
+                entries[0].append(dict(source_id=group['source_ids'][0], group_id=group['id'], mode=group['mode']))
                 grouped.append((imgFileProcessing, entries[0]))
     else:
         grouped = [(imgFileProcessing, item) for item in work]
@@ -842,10 +842,15 @@ def imgFileProcessing(work):
         opt = work[2]
         is_first_page = work[3]
         output = []
-        workImg = image.ComicPageParser((dirpath, afile), is_first_page, opt)
+        single = len(work) > 4 and work[4]['mode'] == 'single'
+        workImg = image.ComicPageParser((dirpath, afile), is_first_page, opt, defer_processing=single)
+        if single:
+            workImg.payload.append(['N', workImg.source, workImg.image.crop(workImg.crop_box),
+                                    workImg.page_background_color, workImg.fill])
+            workImg.image.close()
         for i in workImg.payload:
             img = image.ComicPage(opt, *i)
-            page = processImagePage(img)
+            page = processImagePage(img, contain=single)
             if len(work) > 4:
                 page.extend([work[4]['source_id'], work[4]['group_id'], None])
             output.append(page)
@@ -854,22 +859,22 @@ def imgFileProcessing(work):
         return str(sys.exc_info()[1]), sanitizeTrace(sys.exc_info()[2])
 
 
-def processImagePage(img, geometry=None, method=None):
-    """Preserve native filters/encoding, replacing only paired page fitting."""
+def processImagePage(img, geometry=None, method=None, contain=False):
+    """Preserve native filters/encoding with paired geometry or single-page contain."""
     opt = img.opt
     img.gammaCorrectImage()
     if not img.colorOutput:
         img.convertToGrayscale()
     img.autocontrastImage()
-    if geometry is None:
+    if contain:
+        method = img.resize_method()
+        if opt.upscale or method == Image.Resampling.LANCZOS:
+            img.image = ImageOps.contain(img.image, img.size, method=method)
+    elif geometry is None:
         img.resizeImage()
     else:
         img.image = img.image.resize(geometry['rendered_size'], method)
     img.optimizeForDisplay(opt.eraserainbow, img.colorOutput)
-    if geometry is not None:
-        canvas = Image.new(img.image.mode, opt.profileData[1], img.fill)
-        canvas.paste(img.image, tuple(geometry['offset']))
-        img.image = canvas
     if not img.colorOutput and opt.forcepng:
         if not opt.noquantize:
             img.quantizeImage()
@@ -884,10 +889,9 @@ def imgPairProcessing(work):
         opt = entries[0][2]
         parsers = [image.ComicPageParser((entry[1], entry[0]), entry[3], opt, defer_processing=True)
                    for entry in entries]
-        direction = 'rtl' if opt.righttoleft else 'ltr'
         geometries = chapter_pairing.pair_geometry(
             [parser.image.size for parser in parsers], [parser.crop_box for parser in parsers],
-            opt.profileData[1], direction, opt.upscale)
+            opt.profileData[1], opt.upscale)
         methods = [chapter_pairing.resize_method(g['crop_box'], g['rendered_size']) for g in geometries]
         method = Image.Resampling.LANCZOS if Image.Resampling.LANCZOS in methods else Image.Resampling.BICUBIC
         output = []

@@ -59,7 +59,7 @@ def score_edges(earlier, later, direction):
 
 
 def analyze_chapters(chapters, target, direction, spreadshift=False):
-    """Build an analyzing v1 report from (title, [(source_id, path), ...]).
+    """Build an analyzing v2 report from (title, [(source_id, path), ...]).
 
     Caller excludes the independent cover and supplies CBZ chapter boundaries.
     Only headers and the current adjacent pair's small samples are retained.
@@ -75,7 +75,7 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
         raise ValueError('Source IDs must be positive integers')
     if source_ids != sorted(set(source_ids)):
         raise ValueError('Chapter source ranges must be ordered and disjoint')
-    report = dict(version=1, state='analyzing', target=list(target), direction=direction,
+    report = dict(version=2, state='analyzing', target=list(target), direction=direction,
                   chapters=[], groups=[], pages=[])
     for chapter_id, (title, pages) in enumerate(ordered, 1):
         wide = False
@@ -111,14 +111,14 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
     return report
 
 
-def pair_geometry(sizes, crop_boxes, target, direction, upscale=True):
-    """Return two v1 geometry dictionaries from accepted native crop candidates.
+def pair_geometry(sizes, crop_boxes, target, upscale=True):
+    """Return two v2 geometry dictionaries from accepted native crop candidates.
 
     Native crop mode, first-color exemption, margin and area limits must already
     be applied by the caller; this function preserves both horizontal candidates.
     """
-    if direction not in ('rtl', 'ltr') or len(sizes) != 2 or len(crop_boxes) != 2:
-        raise ValueError('Common geometry requires two pages and rtl/ltr direction')
+    if len(sizes) != 2 or len(crop_boxes) != 2:
+        raise ValueError('Common geometry requires two pages')
     width, height = target
     if width < 1 or height < 1:
         raise ValueError('Target dimensions must be positive')
@@ -139,12 +139,9 @@ def pair_geometry(sizes, crop_boxes, target, direction, upscale=True):
     if content_height < 1:
         raise ValueError('Pair cannot fit the target at a positive common height')
     geometries = []
-    for index, (crop, ratio) in enumerate(zip(crops, ratios)):
+    for crop, ratio in zip(crops, ratios):
         rendered_width = max(1, floor(ratio * content_height))
-        left = (index == 0) == (direction == 'rtl')
-        geometries.append(dict(crop_box=crop, rendered_size=[rendered_width, content_height],
-                               offset=[0 if left else width - rendered_width,
-                                       (height - content_height) // 2]))
+        geometries.append(dict(crop_box=crop, rendered_size=[rendered_width, content_height]))
     return geometries
 
 
