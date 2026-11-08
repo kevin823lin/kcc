@@ -738,24 +738,36 @@ def analyzeChapterPairing(images_path, chapter_names, source, job_progress=''):
         list(chapters.values()), options.profileData[1],
         'rtl' if options.righttoleft else 'ltr', options.spreadshift)
     print(f'{job_progress}chapterPairingAnalysis: {perf_counter() - start} seconds')
+    first_groups = {}
+    for group in report['groups']:
+        groups = first_groups.setdefault(group['chapter_id'], [])
+        if len(groups) < 3:
+            groups.append(group['source_ids'])
     for chapter in report['chapters']:
-        layout = '1 | 23 | 45' if chapter['spreadshift'] else '12 | 34 | 56'
+        positions = {source_id: index for index, source_id in enumerate(chapter['source_ids'], 1)}
+        layout = ' | '.join(''.join(str(positions[source_id]) for source_id in group)
+                            for group in first_groups[chapter['id']])
         if chapter['mode'] == 'native':
             decision = 'native (wide or square source image)'
-        elif chapter['anchor']:
-            anchor = chapter['anchor']
-            first = anchor['source_ids'][0] - chapter['source_ids'][0] + 1
-            if anchor.get('method') == 'edge_profile':
-                metric = f'outer edge correlation {anchor["score"]:.3f}'
-            elif anchor.get('method') == 'strip_fallback':
-                metric = f'fallback strip correlation {anchor["score"]:.3f}'
-            elif anchor.get('method') == 'strip':
-                metric = f'strip correlation {anchor["score"]:.3f}'
-            else:
-                metric = f'RGB distance {anchor["score"]:.2f}'
-            decision = f'{layout} (chapter pages {first}/{first + 1}, {metric})'
         else:
-            decision = f'{layout} (configured spreadshift)'
+            decisions = []
+            for label, anchor in (('opening', chapter['opening_anchor']), ('body', chapter['anchor'])):
+                if anchor is None:
+                    decisions.append(f'{label}: no match')
+                    continue
+                first = positions[anchor['source_ids'][0]]
+                if anchor.get('method') == 'edge_profile':
+                    metric = f'outer edge correlation {anchor["score"]:.3f}'
+                elif anchor.get('method') == 'strip_fallback':
+                    metric = f'fallback strip correlation {anchor["score"]:.3f}'
+                elif anchor.get('method') == 'strip':
+                    metric = f'strip correlation {anchor["score"]:.3f}'
+                else:
+                    metric = f'RGB distance {anchor["score"]:.2f}'
+                decisions.append(f'{label}: chapter pages {first}/{first + 1}, {metric}')
+            if chapter['reason'] == 'spreadshift':
+                decisions.append('configured spreadshift')
+            decision = f'{layout} ({"; ".join(decisions)})'
         print(f'{job_progress}Chapter pairing [{chapter["title"]}]: {decision}')
     return report
 

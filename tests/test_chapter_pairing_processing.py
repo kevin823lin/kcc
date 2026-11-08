@@ -260,6 +260,37 @@ class PairingProcessingTests(unittest.TestCase):
                          [('42 源章名', [2, 10]), ('43 源章名', [20])])
         self.assertEqual(fusion['state'], 'analyzing')
 
+    def test_real_seams_log_and_dispatch_opening_then_shifted_body_in_both_directions(self):
+        for direction in ('rtl', 'ltr'):
+            with self.subTest(direction=direction):
+                c2e.options = self.options('--spreadshift', *(['--manga-style'] if direction == 'rtl' else []))
+                paths = [self.source(source_id, (60, 100), 255, folder=direction)
+                         for source_id in range(11, 18)]
+                first_x, second_x = (2, 57) if direction == 'rtl' else (57, 2)
+                for first in (0, 3):
+                    for path, x in zip(paths[first:first + 2], (first_x, second_x)):
+                        with Image.open(path) as source:
+                            bitmap = source.copy()
+                        for y in range(100):
+                            value = 60 if y // 2 % 2 else 180
+                            bitmap.putpixel((x, y), (value,) * 3)
+                        bitmap.save(path)
+                with patch('builtins.print') as output:
+                    c2e.pairing_plan = c2e.analyzeChapterPairing(self.root / direction, {}, 'one.cbz')
+                log = '\n'.join(str(call.args[0]) for call in output.call_args_list)
+                self.assertIn('12 | 3 | 45', log)
+                self.assertIn('opening: chapter pages 1/2, RGB distance 0.00', log)
+                self.assertIn('body: chapter pages 4/5, RGB distance 0.00', log)
+                self.assertEqual([group['source_ids'] for group in c2e.pairing_plan['groups']],
+                                 [[11, 12], [13], [14, 15], [16, 17]])
+                pool = Mock()
+                with patch.object(c2e, 'Pool', return_value=pool):
+                    c2e.imgDirectoryProcessing(str(self.root / direction))
+                calls = pool.apply_async.call_args_list
+                self.assertEqual([call.kwargs['func'] for call in calls],
+                                 [c2e.imgPairProcessing, c2e.imgFileProcessing,
+                                  c2e.imgPairProcessing, c2e.imgPairProcessing])
+
     def test_callback_keeps_geometry_by_resource_even_when_results_finish_out_of_order(self):
         c2e.options = self.options()
         c2e.options.imgMetadata = {}
@@ -316,7 +347,7 @@ class PairingProcessingTests(unittest.TestCase):
             self.source(source_id, size, folder='native')
         c2e.pairing_plan = c2e.analyzeChapterPairing(self.root, {'paired': 'paired', 'native': 'native'}, 'fused')
         self.assertEqual([chapter['mode'] for chapter in c2e.pairing_plan['chapters']], ['paired', 'native'])
-        self.assertEqual(c2e.pairing_plan['version'], 2)
+        self.assertEqual(c2e.pairing_plan['version'], 3)
         with patch.object(c2e, 'Pool', side_effect=lambda **kwargs: Pool(2, **kwargs)):
             c2e.imgDirectoryProcessing(str(self.root))
         opt = self.options('--upscale')

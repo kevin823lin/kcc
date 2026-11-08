@@ -135,7 +135,7 @@ class PairingEpubTests(unittest.TestCase):
                 self.assertEqual(len(pages), 5)
 
     def test_parent_report_writes_atomically_and_requires_absolute_path(self):
-        c2e.pairing_plan = dict(version=2, state='analyzing', pages=[])
+        c2e.pairing_plan = dict(version=3, state='analyzing', pages=[])
         report = self.root / 'pairing.json'
         with patch.dict(os.environ, {'CBZ2KEPUB_PAIRING_REPORT': str(report)}), \
                 patch.object(c2e.os, 'replace', wraps=os.replace) as replace:
@@ -148,7 +148,7 @@ class PairingEpubTests(unittest.TestCase):
                 c2e.writePairingReport()
 
     def test_report_capacity_hook_receives_actual_encoded_bytes_before_write(self):
-        c2e.pairing_plan = dict(version=2, state='analyzing', chapters=[dict(title='測試')])
+        c2e.pairing_plan = dict(version=3, state='analyzing', chapters=[dict(title='測試')])
         path = self.root / 'pairing.json'
         observed = []
         def check(destination, size):

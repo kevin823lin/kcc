@@ -2,7 +2,7 @@
 
 Sampling/scoring adapted from Mihon Desktop SharedSpreadMatching at
 3d7652e30698508aa0c17798104037708d879b02 (Apache-2.0).
-Modified: Python/Pillow sampling, chapter first-match policy and geometry.
+Modified: Python/Pillow sampling, independent opening/body detection and geometry.
 See third_party/mihon-desktop-NOTICE.txt and Apache-2.0.txt.
 """
 
@@ -127,8 +127,63 @@ def score_edges(earlier, later, direction):
     return total / SAMPLE_POINTS
 
 
+def _find_anchor(pages, direction):
+    """Find the first candidate in the strongest tier across these pages."""
+    if len(pages) < 2:
+        return None, None
+    anchor = anchor_index = None
+    previous = strip_previous = strip_anchor = strip_anchor_index = None
+    fallback_anchor = fallback_anchor_index = None
+    profile_previous = profile_anchor = profile_anchor_index = None
+    for index, (source_id, path) in enumerate(pages):
+        with Image.open(path) as image:
+            current = sample_edges(image)
+            current_strip = sample_strips(image) if strip_anchor is None else None
+            current_profile = (sample_strips(image, width=1)
+                               if strip_anchor is None and fallback_anchor is None
+                               and profile_anchor is None else None)
+        if previous is not None:
+            score = score_edges(previous, current, direction)
+            if score is not None:
+                anchor_index = index - 1
+                anchor = dict(source_ids=[pages[index - 1][0], source_id], score=score)
+                break
+            if strip_anchor is None:
+                strip_score = score_strips(strip_previous, current_strip, direction)
+                if strip_score is not None:
+                    strip_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                        score=strip_score)
+                    strip_anchor_index = index - 1
+                elif fallback_anchor is None:
+                    fallback_score = score_strips(strip_previous, current_strip, direction, fallback=True)
+                    if fallback_score is not None:
+                        fallback_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                               score=fallback_score, method='strip_fallback')
+                        fallback_anchor_index = index - 1
+            if strip_anchor is None and fallback_anchor is None and profile_anchor is None:
+                profile_score = score_edge_profiles(profile_previous, current_profile, direction)
+                if profile_score is not None:
+                    profile_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                          score=profile_score, method='edge_profile')
+                    profile_anchor_index = index - 1
+        previous = current
+        profile_previous = current_profile
+        if strip_anchor is None:
+            strip_previous = current_strip
+    if anchor is None and strip_anchor is not None:
+        anchor_index = strip_anchor_index
+        anchor = dict(strip_anchor, method='strip')
+    elif anchor is None and fallback_anchor is not None:
+        anchor_index = fallback_anchor_index
+        anchor = fallback_anchor
+    elif anchor is None and profile_anchor is not None:
+        anchor_index = profile_anchor_index
+        anchor = profile_anchor
+    return anchor, anchor_index
+
+
 def analyze_chapters(chapters, target, direction, spreadshift=False):
-    """Build an analyzing v2 report from (title, [(source_id, path), ...]).
+    """Build an analyzing v3 report from (title, [(source_id, path), ...]).
 
     Caller excludes the independent cover and supplies CBZ chapter boundaries.
     Only headers and the current adjacent pair's small samples are retained.
@@ -144,69 +199,32 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
         raise ValueError('Source IDs must be positive integers')
     if source_ids != sorted(set(source_ids)):
         raise ValueError('Chapter source ranges must be ordered and disjoint')
-    report = dict(version=2, state='analyzing', target=list(target), direction=direction,
+    report = dict(version=3, state='analyzing', target=list(target), direction=direction,
                   chapters=[], groups=[], pages=[])
     for chapter_id, (title, pages) in enumerate(ordered, 1):
         wide = False
         for _, path in pages:
             with Image.open(path) as image:
                 wide |= image.width >= image.height
-        shift, anchor = bool(spreadshift), None
+        shift, anchor, opening_anchor = bool(spreadshift), None, None
         if not wide:
-            previous = strip_previous = strip_anchor = strip_anchor_index = None
-            fallback_anchor = fallback_anchor_index = None
-            profile_previous = profile_anchor = profile_anchor_index = None
-            for index, (source_id, path) in enumerate(pages):
-                with Image.open(path) as image:
-                    current = sample_edges(image)
-                    current_strip = sample_strips(image) if strip_anchor is None else None
-                    current_profile = (sample_strips(image, width=1)
-                                       if strip_anchor is None and fallback_anchor is None
-                                       and profile_anchor is None else None)
-                if previous is not None:
-                    score = score_edges(previous, current, direction)
-                    if score is not None:
-                        shift = bool((index - 1) % 2)
-                        anchor = dict(source_ids=[pages[index - 1][0], source_id], score=score)
-                        break
-                    if strip_anchor is None:
-                        strip_score = score_strips(strip_previous, current_strip, direction)
-                        if strip_score is not None:
-                            strip_anchor = dict(source_ids=[pages[index - 1][0], source_id],
-                                                score=strip_score)
-                            strip_anchor_index = index - 1
-                        elif fallback_anchor is None:
-                            fallback_score = score_strips(strip_previous, current_strip, direction, fallback=True)
-                            if fallback_score is not None:
-                                fallback_anchor = dict(source_ids=[pages[index - 1][0], source_id],
-                                                       score=fallback_score, method='strip_fallback')
-                                fallback_anchor_index = index - 1
-                    if strip_anchor is None and fallback_anchor is None and profile_anchor is None:
-                        profile_score = score_edge_profiles(profile_previous, current_profile, direction)
-                        if profile_score is not None:
-                            profile_anchor = dict(source_ids=[pages[index - 1][0], source_id],
-                                                  score=profile_score, method='edge_profile')
-                            profile_anchor_index = index - 1
-                previous = current
-                profile_previous = current_profile
-                if strip_anchor is None:
-                    strip_previous = current_strip
-            if anchor is None and strip_anchor is not None:
-                shift = bool(strip_anchor_index % 2)
-                anchor = dict(strip_anchor, method='strip')
-            elif anchor is None and fallback_anchor is not None:
-                shift = bool(fallback_anchor_index % 2)
-                anchor = fallback_anchor
-            elif anchor is None and profile_anchor is not None:
-                shift = bool(profile_anchor_index % 2)
-                anchor = profile_anchor
+            opening_anchor, _ = _find_anchor(pages[:2], direction)
+            body_start = 2 if opening_anchor else 1
+            # shortcut: unmatched p2 is sampled twice; cache it if profiling shows a cost.
+            anchor, anchor_index = _find_anchor(pages[body_start:], direction)
+            if anchor is not None:
+                shift = bool((body_start + anchor_index) % 2)
+            elif opening_anchor is not None:
+                shift = False
         report['chapters'].append(dict(
             id=chapter_id, title=title, source_ids=[page[0] for page in pages],
             mode='native' if wide else 'paired', spreadshift=shift,
-            reason='wide_image' if wide else 'detected' if anchor else 'spreadshift', anchor=anchor))
+            reason='wide_image' if wide else 'detected' if anchor else 'opening' if opening_anchor else 'spreadshift',
+            opening_anchor=opening_anchor, anchor=anchor))
         index = 0
         while index < len(pages):
-            paired = not wide and not (shift and index == 0) and index + 1 < len(pages)
+            paired = (not wide and not (shift and index == (2 if opening_anchor else 0))
+                      and index + 1 < len(pages))
             count = 2 if paired else 1
             report['groups'].append(dict(
                 id=len(report['groups']) + 1, chapter_id=chapter_id,

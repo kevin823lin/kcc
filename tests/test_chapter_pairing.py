@@ -157,21 +157,115 @@ class AnalysisTests(unittest.TestCase):
             result.append((start + index, path))
         return result
 
-    def test_first_match_parity_and_early_stop(self):
-        for anchor_index in (0, 1, 2, 3):
+    def analyze_matches(self, pages, matches, direction='rtl', shift=True):
+        scored = []
+
+        def samples(image, **kwargs):
+            return int(Path(image.filename).stem)
+
+        def score(method, earlier, later, actual_direction):
+            self.assertEqual(actual_direction, direction)
+            scored.append((method, earlier, later))
+            return matches.get((method, earlier, later))
+
+        with (patch('kindlecomicconverter.chapter_pairing.sample_edges', side_effect=samples) as sample,
+              patch('kindlecomicconverter.chapter_pairing.sample_strips', side_effect=samples),
+              patch('kindlecomicconverter.chapter_pairing.score_edges',
+                    side_effect=lambda a, b, d: score('rgb', a, b, d)),
+              patch('kindlecomicconverter.chapter_pairing.score_strips',
+                    side_effect=lambda a, b, d, fallback=False:
+                    score('strip_fallback' if fallback else 'strip', a, b, d)),
+              patch('kindlecomicconverter.chapter_pairing.score_edge_profiles',
+                    side_effect=lambda a, b, d: score('edge_profile', a, b, d))):
+            report = analyze_chapters([('chapter', pages)], [100, 200], direction, shift)
+        return report, scored, sample.call_count
+
+    def test_body_first_match_parity_and_early_stop(self):
+        for anchor_index in (1, 2, 3, 4):
             with self.subTest(anchor_index=anchor_index):
-                pages = self.pages(7)
-                with (patch('kindlecomicconverter.chapter_pairing.sample_edges', return_value=()) as sample,
-                     patch('kindlecomicconverter.chapter_pairing.score_edges',
-                           side_effect=[None] * anchor_index + [12.5]) as score):
-                    report = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)
+                report, scored, samples = self.analyze_matches(
+                    self.pages(7), {('rgb', anchor_index + 1, anchor_index + 2): 12.5})
                 chapter = report['chapters'][0]
                 self.assertEqual(chapter['spreadshift'], bool(anchor_index % 2))
+                self.assertIsNone(chapter['opening_anchor'])
                 self.assertEqual(chapter['anchor'], dict(source_ids=[anchor_index + 1, anchor_index + 2], score=12.5))
-                self.assertEqual(sample.call_count, anchor_index + 2)
-                self.assertEqual(score.call_count, anchor_index + 1)
+                self.assertEqual(samples, anchor_index + 3)  # p2 is sampled again for the independent body.
+                self.assertEqual(sum(method == 'rgb' for method, _, _ in scored), anchor_index + 1)
                 expected = [[1], [2, 3], [4, 5], [6, 7]] if anchor_index % 2 else [[1, 2], [3, 4], [5, 6], [7]]
                 self.assertEqual([g['source_ids'] for g in report['groups']], expected)
+
+    def test_opening_and_body_use_all_tiers_independently_without_scoring_2_3(self):
+        methods = ('rgb', 'strip', 'strip_fallback', 'edge_profile')
+        for direction in ('rtl', 'ltr'):
+            for opening in methods:
+                for body in methods:
+                    with self.subTest(direction=direction, opening=opening, body=body):
+                        report, scored, _ = self.analyze_matches(
+                            self.pages(7, start=11),
+                            {(opening, 11, 12): .97, (body, 14, 15): .98,
+                             ('rgb', 12, 13): 0}, direction)
+                        chapter = report['chapters'][0]
+                        self.assertEqual(chapter['opening_anchor']['source_ids'], [11, 12])
+                        self.assertEqual(chapter['opening_anchor'].get('method', 'rgb'), opening)
+                        self.assertEqual(chapter['anchor']['source_ids'], [14, 15])
+                        self.assertEqual(chapter['anchor'].get('method', 'rgb'), body)
+                        self.assertFalse(any((a, b) == (12, 13) for _, a, b in scored))
+                        self.assertEqual(chapter['reason'], 'detected')
+                        self.assertTrue(chapter['spreadshift'])
+                        self.assertEqual([g['source_ids'] for g in report['groups']],
+                                         [[11, 12], [13], [14, 15], [16, 17]])
+
+    def test_no_opening_keeps_2_3_eligible_in_all_tiers(self):
+        for direction in ('rtl', 'ltr'):
+            for method in ('rgb', 'strip', 'strip_fallback', 'edge_profile'):
+                with self.subTest(direction=direction, method=method):
+                    report, _, _ = self.analyze_matches(
+                        self.pages(5, start=20), {(method, 21, 22): .98}, direction, False)
+                    chapter = report['chapters'][0]
+                    self.assertIsNone(chapter['opening_anchor'])
+                    self.assertEqual(chapter['anchor']['source_ids'], [21, 22])
+                    self.assertEqual(chapter['anchor'].get('method', 'rgb'), method)
+                    self.assertTrue(chapter['spreadshift'])
+                    self.assertEqual([g['source_ids'] for g in report['groups']],
+                                     [[20], [21, 22], [23, 24]])
+
+    def test_opening_with_body_3_4_keeps_global_even_parity(self):
+        for direction in ('rtl', 'ltr'):
+            report, _, _ = self.analyze_matches(
+                self.pages(6), {('edge_profile', 1, 2): .98, ('rgb', 3, 4): 0}, direction)
+            chapter = report['chapters'][0]
+            self.assertEqual(chapter['anchor']['source_ids'], [3, 4])
+            self.assertFalse(chapter['spreadshift'])
+            self.assertEqual([group['source_ids'] for group in report['groups']], [[1, 2], [3, 4], [5, 6]])
+
+    def test_opening_only_overrides_config_and_keeps_normal_body(self):
+        for shift in (False, True):
+            for method in ('rgb', 'strip', 'strip_fallback', 'edge_profile'):
+                with self.subTest(shift=shift, method=method):
+                    report, _, _ = self.analyze_matches(
+                        self.pages(5), {(method, 1, 2): .98}, shift=shift)
+                    chapter = report['chapters'][0]
+                    self.assertEqual(chapter['reason'], 'opening')
+                    self.assertIsNone(chapter['anchor'])
+                    self.assertFalse(chapter['spreadshift'])
+                    self.assertEqual([g['source_ids'] for g in report['groups']], [[1, 2], [3, 4], [5]])
+
+    def test_one_and_two_page_chapters_use_opening_or_config_without_body(self):
+        for count in (1, 2):
+            for matched in (False, True):
+                for shift in (False, True):
+                    with self.subTest(count=count, matched=matched, shift=shift):
+                        report, scored, _ = self.analyze_matches(
+                            self.pages(count), {('rgb', 1, 2): 0} if matched else {}, shift=shift)
+                        chapter = report['chapters'][0]
+                        has_opening = matched and count == 2
+                        self.assertIsNone(chapter['anchor'])
+                        self.assertEqual(chapter['reason'], 'opening' if has_opening else 'spreadshift')
+                        self.assertEqual(chapter['spreadshift'], shift and not has_opening)
+                        self.assertEqual(chapter['opening_anchor'] is not None, has_opening)
+                        expected = [[1]] if count == 1 else [[1, 2]] if has_opening or not shift else [[1], [2]]
+                        self.assertEqual([g['source_ids'] for g in report['groups']], expected)
+                        self.assertEqual(sum(method == 'rgb' for method, _, _ in scored), count - 1)
 
     def test_no_candidate_uses_fallback_with_single_edges(self):
         for shift, expected in ((False, [[1, 2], [3]]), (True, [[1], [2, 3]])):
@@ -179,6 +273,7 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(report['chapters'][0]['reason'], 'spreadshift')
             self.assertIsNone(report['chapters'][0]['anchor'])
             self.assertEqual([g['source_ids'] for g in report['groups']], expected)
+            self.assertEqual(report['version'], 3)
             self.assertEqual(report['state'], 'analyzing')
             self.assertEqual(report['pages'], [])
 
@@ -194,7 +289,7 @@ class AnalysisTests(unittest.TestCase):
                     image.putpixel((x, y), (value, value, value))
                 image.save(path)
             report = analyze_chapters([('chapter', pages)], [100, 200], direction, True)
-            self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[1, 2], score=0))
+            self.assertEqual(report['chapters'][0]['opening_anchor'], dict(source_ids=[1, 2], score=0))
             self.assertFalse(report['chapters'][0]['spreadshift'])
 
     def test_real_inner_strips_detect_both_directions_when_edges_differ(self):
@@ -212,23 +307,30 @@ class AnalysisTests(unittest.TestCase):
                         image.putpixel((x, y), (value, value, value))
                 image.save(path)
             report = analyze_chapters([('chapter', pages)], [100, 200], direction, True)
-            anchor = report['chapters'][0]['anchor']
+            anchor = report['chapters'][0]['opening_anchor']
             self.assertEqual(anchor['source_ids'], [1, 2])
             self.assertEqual(anchor['method'], 'strip')
             self.assertEqual(set(anchor), {'source_ids', 'method', 'score'})
             self.assertGreaterEqual(anchor['score'], .93)
             self.assertFalse(report['chapters'][0]['spreadshift'])
 
-    def test_later_strict_match_overrides_earlier_strip_match(self):
-        pages = self.pages(4)
-        signal = [80 if i % 2 else 170 for i in range(50)]
-        with (patch('kindlecomicconverter.chapter_pairing.sample_edges', return_value=()) as sample,
-              patch('kindlecomicconverter.chapter_pairing.sample_strips', return_value=(signal, signal)) as strips,
-              patch('kindlecomicconverter.chapter_pairing.score_edges', side_effect=[None, None, 12.5])):
-            report = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)
-        self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[3, 4], score=12.5))
-        self.assertEqual(sample.call_count, 4)
-        self.assertEqual(strips.call_count, 4)
+    def test_body_later_stronger_tier_overrides_earlier_candidates(self):
+        for winner, matches, expected_pair in (
+                ('rgb', {('edge_profile', 2, 3): .98, ('strip_fallback', 3, 4): .85,
+                         ('strip', 4, 5): .95, ('rgb', 5, 6): 12.5}, [5, 6]),
+                ('strip', {('edge_profile', 2, 3): .98, ('strip_fallback', 3, 4): .85,
+                           ('strip', 4, 5): .95}, [4, 5]),
+                ('strip_fallback', {('edge_profile', 2, 3): .98,
+                                    ('strip_fallback', 3, 4): .85}, [3, 4]),
+                ('edge_profile', {('edge_profile', 2, 3): .98,
+                                  ('edge_profile', 3, 4): .99}, [2, 3])):
+            with self.subTest(winner=winner):
+                report, _, _ = self.analyze_matches(self.pages(7), matches)
+                chapter = report['chapters'][0]
+                self.assertIsNone(chapter['opening_anchor'])
+                self.assertEqual(chapter['anchor'].get('method', 'rgb'), winner)
+                self.assertEqual(chapter['anchor']['source_ids'], expected_pair)
+                self.assertEqual(chapter['spreadshift'], bool((expected_pair[0] - 1) % 2))
 
     def test_real_outermost_profiles_detect_narrow_contours_in_both_directions(self):
         profile = [0] * 20 + [160] + [0] * 26 + [40, 160, 150]
@@ -245,52 +347,13 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(chapter['anchor'], dict(source_ids=[2, 3], score=1, method='edge_profile'))
             self.assertTrue(chapter['spreadshift'])
 
-    def test_edge_profile_waits_for_all_higher_priority_candidates(self):
-        pages = self.pages(4)
-        for method in ('rgb', 'strip', 'strip_fallback', 'edge_profile'):
-            with self.subTest(method=method):
-                strict_scores = iter([None, .96 if method == 'strip' else None, None])
-                fallback_scores = iter([None, .96 if method == 'strip_fallback' else None, None])
-                def strips(earlier, later, direction, *, fallback=False):
-                    return next(fallback_scores if fallback else strict_scores)
-                with (patch('kindlecomicconverter.chapter_pairing.score_edges',
-                            side_effect=[None, 12.5 if method == 'rgb' else None, None]),
-                      patch('kindlecomicconverter.chapter_pairing.score_strips', side_effect=strips),
-                      patch('kindlecomicconverter.chapter_pairing.score_edge_profiles', return_value=.98) as profile):
-                    chapter = analyze_chapters([('chapter', pages)], [100, 200], 'rtl')['chapters'][0]
-                profile.assert_called_once()
-                self.assertEqual(chapter['anchor'].get('method', 'rgb'), method)
-                self.assertEqual(chapter['anchor']['source_ids'], [1, 2] if method == 'edge_profile' else [2, 3])
-                self.assertEqual(chapter['spreadshift'], method != 'edge_profile')
-
-    def test_fallback_is_deferred_until_all_legacy_candidates_are_checked(self):
-        pages = self.pages(4)
-        signal = [80 if i % 2 else 170 for i in range(50)]
-        for legacy in ('rgb', 'strip', None):
-            with self.subTest(legacy=legacy):
-                def score(earlier, later, direction, *, fallback=False):
-                    return .85 if fallback else next(strict)
-                strict = iter([None, .95 if legacy == 'strip' else None, None])
-                with (patch('kindlecomicconverter.chapter_pairing.sample_strips', return_value=(signal,) * 2),
-                      patch('kindlecomicconverter.chapter_pairing.score_edges',
-                            side_effect=[None, None, 12.5 if legacy == 'rgb' else None]),
-                      patch('kindlecomicconverter.chapter_pairing.score_strips', side_effect=score)):
-                    chapter = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)['chapters'][0]
-                if legacy == 'rgb':
-                    self.assertEqual(chapter['anchor'], dict(source_ids=[3, 4], score=12.5))
-                    self.assertFalse(chapter['spreadshift'])
-                elif legacy == 'strip':
-                    self.assertEqual(chapter['anchor'], dict(source_ids=[2, 3], score=.95, method='strip'))
-                    self.assertTrue(chapter['spreadshift'])
-                else:
-                    self.assertEqual(chapter['anchor'], dict(source_ids=[1, 2], score=.85, method='strip_fallback'))
-                    self.assertFalse(chapter['spreadshift'])
-
     def test_last_wide_page_forces_whole_chapter_native_without_sampling(self):
         with patch('kindlecomicconverter.chapter_pairing.sample_edges') as sample:
             report = analyze_chapters([('wide', self.pages(5, wide_at=4))], [100, 200], 'rtl', True)
         sample.assert_not_called()
         self.assertEqual(report['chapters'][0]['reason'], 'wide_image')
+        self.assertIsNone(report['chapters'][0]['opening_anchor'])
+        self.assertIsNone(report['chapters'][0]['anchor'])
         self.assertTrue(report['chapters'][0]['spreadshift'])
         self.assertEqual([g['mode'] for g in report['groups']], ['native'] * 5)
 
