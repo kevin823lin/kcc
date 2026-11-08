@@ -8,11 +8,13 @@ See third_party/mihon-desktop-NOTICE.txt and Apache-2.0.txt.
 
 from fractions import Fraction
 from math import ceil, floor
+from statistics import correlation, pvariance
 
 from PIL import Image
 
 
 SAMPLE_POINTS = 50
+STRIP_WIDTH = 8
 
 
 def sample_edges(image):
@@ -31,6 +33,49 @@ def sample_edges(image):
                 edge.append(tuple((c * alpha + 255 * (255 - alpha) + 127) // 255 for c in rgb))
             edges.append(edge)
     return tuple(edges)
+
+
+def sample_strips(image):
+    """Return 50 mean grayscale samples from each 8px inner edge strip."""
+    width, height = image.size
+    strips = []
+    for box in ((0, 0, min(STRIP_WIDTH, width), height),
+                (max(0, width - STRIP_WIDTH), 0, width, height)):
+        strip = image.crop(box)
+        if 'I;16' in image.mode:
+            reduced = strip.resize((1, SAMPLE_POINTS), Image.Resampling.BOX)
+            samples = [reduced.getpixel((0, y)) // 256 for y in range(SAMPLE_POINTS)]
+        else:
+            rgba = strip.convert('RGBA')
+            white = Image.new('RGBA', rgba.size, 'white')
+            reduced = Image.alpha_composite(white, rgba).convert('L').resize(
+                (1, SAMPLE_POINTS), Image.Resampling.BOX)
+            samples = [reduced.getpixel((0, y)) for y in range(SAMPLE_POINTS)]
+        strips.append(samples)
+    return tuple(strips)
+
+
+def score_strips(earlier, later, direction):
+    """Return full-strip Pearson correlation when non-margin bins corroborate it."""
+    if direction not in ('rtl', 'ltr'):
+        raise ValueError('Pairing direction must be rtl or ltr')
+    first, second = (earlier[0], later[1]) if direction == 'rtl' else (earlier[1], later[0])
+    if len(first) != SAMPLE_POINTS or len(second) != SAMPLE_POINTS:
+        raise ValueError('Pairing requires 50 samples per strip')
+    if (all(sum(v > 220 for v in strip) >= 40 for strip in (first, second))
+            or all(sum(v < 50 for v in strip) >= 40 for strip in (first, second))):
+        return None
+    pairs = [(a, b) for a, b in zip(first, second) if 20 <= a <= 235 and 20 <= b <= 235]
+    if len(pairs) < 15:
+        return None
+
+    if sum(abs(a - b) for a, b in zip(first, second)) > 16 * SAMPLE_POINTS:
+        return None
+    a, b = zip(*pairs)
+    if pvariance(a) < 100 or pvariance(b) < 100 or correlation(a, b) < .80:
+        return None
+    score = correlation(first, second)
+    return min(1, score) if score >= .93 else None
 
 
 def score_edges(earlier, later, direction):
@@ -84,17 +129,29 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
                 wide |= image.width >= image.height
         shift, anchor = bool(spreadshift), None
         if not wide:
-            previous = None
+            previous = strip_previous = strip_anchor = strip_anchor_index = None
             for index, (source_id, path) in enumerate(pages):
                 with Image.open(path) as image:
                     current = sample_edges(image)
+                    current_strip = sample_strips(image) if strip_anchor is None else None
                 if previous is not None:
                     score = score_edges(previous, current, direction)
                     if score is not None:
                         shift = bool((index - 1) % 2)
                         anchor = dict(source_ids=[pages[index - 1][0], source_id], score=score)
                         break
+                    if strip_anchor is None:
+                        strip_score = score_strips(strip_previous, current_strip, direction)
+                        if strip_score is not None:
+                            strip_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                                score=strip_score)
+                            strip_anchor_index = index - 1
                 previous = current
+                if strip_anchor is None:
+                    strip_previous = current_strip
+            if anchor is None and strip_anchor is not None:
+                shift = bool(strip_anchor_index % 2)
+                anchor = dict(strip_anchor, method='strip')
         report['chapters'].append(dict(
             id=chapter_id, title=title, source_ids=[page[0] for page in pages],
             mode='native' if wide else 'paired', spreadshift=shift,

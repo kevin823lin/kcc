@@ -745,7 +745,9 @@ def analyzeChapterPairing(images_path, chapter_names, source, job_progress=''):
         elif chapter['anchor']:
             anchor = chapter['anchor']
             first = anchor['source_ids'][0] - chapter['source_ids'][0] + 1
-            decision = f'{layout} (chapter pages {first}/{first + 1}, RGB distance {anchor["score"]:.2f})'
+            metric = (f'strip correlation {anchor["score"]:.3f}' if anchor.get('method') == 'strip'
+                      else f'RGB distance {anchor["score"]:.2f}')
+            decision = f'{layout} (chapter pages {first}/{first + 1}, {metric})'
         else:
             decision = f'{layout} (configured spreadshift)'
         print(f'{job_progress}Chapter pairing [{chapter["title"]}]: {decision}')

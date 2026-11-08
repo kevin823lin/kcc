@@ -6,7 +6,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from kindlecomicconverter.chapter_pairing import (
-    analyze_chapters, pair_geometry, resize_method, sample_edges, score_edges,
+    analyze_chapters, pair_geometry, resize_method, sample_edges, sample_strips, score_edges, score_strips,
 )
 
 
@@ -66,6 +66,45 @@ class EdgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_edges(([], []), ([], []), 'rtl')
 
+    def test_strip_signature_ignores_shared_flat_borders_and_checks_signal(self):
+        signal = [80 if i % 2 else 170 for i in range(50)]
+        shifted = [value + 8 for value in signal]
+        self.assertAlmostEqual(score_strips((signal, signal), (shifted, shifted), 'rtl'), 1)
+        border_only = [signal[i] if 20 <= i < 30 else 255 for i in range(50)]
+        self.assertIsNone(score_strips((border_only, border_only), (border_only, border_only), 'rtl'))
+        self.assertIsNone(score_strips((signal, signal), ([value + 17 for value in signal],) * 2, 'rtl'))
+        flat = [120] * 50
+        self.assertIsNone(score_strips((flat, flat), (flat, flat), 'rtl'))
+        for shade in (230, 40):
+            tinted_margin = [shade] * 40 + [100, 180] * 5
+            self.assertIsNone(score_strips((tinted_margin,) * 2, (tinted_margin,) * 2, 'rtl'))
+        mixed_flat = [120 if i < 20 else 255 for i in range(50)]
+        self.assertIsNone(score_strips((mixed_flat, mixed_flat), (mixed_flat, mixed_flat), 'rtl'))
+        inverted = [255] * 10 + [80 if i % 2 else 170 for i in range(30)] + [255] * 10
+        unrelated = [255] * 10 + [170 if i % 2 else 80 for i in range(30)] + [255] * 10
+        self.assertIsNone(score_strips((inverted, inverted), (unrelated, unrelated), 'rtl'))
+
+    def test_strip_sampling_uses_both_inner_eight_pixel_strips(self):
+        image = Image.new('RGB', (20, 50), 'white')
+        for y in range(50):
+            image.putpixel((0, y), (y, y, y))
+            image.putpixel((19, y), (255 - y, 255 - y, 255 - y))
+        left, right = sample_strips(image)
+        self.assertEqual(left[0], round((7 * 255 + 0) / 8))
+        self.assertEqual(right[0], 255)
+
+    def test_textured_seam_can_match_despite_local_halftone_differences(self):
+        # The shared white margin contributes to the full-page score. The art still
+        # has to correlate independently even with alternating dark/light offsets.
+        edge = [255] * 30 + [100, 150, 100, 150] * 5
+        textured = [255] * 30 + [82, 132, 118, 168] * 5
+        score = score_strips((edge, edge), (textured, textured), 'rtl')
+        self.assertGreaterEqual(score, .93)
+
+    def test_strip_sampling_scales_16_bit_and_composites_transparency(self):
+        self.assertEqual(sample_strips(Image.new('I;16', (3, 50), 32768))[0], [128] * 50)
+        self.assertEqual(sample_strips(Image.new('RGBA', (3, 50), (0, 0, 0, 128)))[0], [127] * 50)
+
 
 class AnalysisTests(unittest.TestCase):
     def setUp(self):
@@ -120,6 +159,39 @@ class AnalysisTests(unittest.TestCase):
             report = analyze_chapters([('chapter', pages)], [100, 200], direction, True)
             self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[1, 2], score=0))
             self.assertFalse(report['chapters'][0]['spreadshift'])
+
+    def test_real_inner_strips_detect_both_directions_when_edges_differ(self):
+        for direction in ('rtl', 'ltr'):
+            pages = self.pages(3)
+            edge_columns = ((0, 7), (42, 49))
+            first_side, second_side = edge_columns if direction == 'rtl' else edge_columns[::-1]
+            for page, side, offset in ((pages[0], first_side, 0), (pages[1], second_side, 12)):
+                _, path = page
+                with Image.open(path) as source:
+                    image = source.copy()
+                for y in range(100):
+                    value = (60 if y // 2 % 2 else 180) + offset
+                    for x in range(side[0], side[1] + 1):
+                        image.putpixel((x, y), (value, value, value))
+                image.save(path)
+            report = analyze_chapters([('chapter', pages)], [100, 200], direction, True)
+            anchor = report['chapters'][0]['anchor']
+            self.assertEqual(anchor['source_ids'], [1, 2])
+            self.assertEqual(anchor['method'], 'strip')
+            self.assertEqual(set(anchor), {'source_ids', 'method', 'score'})
+            self.assertGreaterEqual(anchor['score'], .93)
+            self.assertFalse(report['chapters'][0]['spreadshift'])
+
+    def test_later_strict_match_overrides_earlier_strip_match(self):
+        pages = self.pages(4)
+        signal = [80 if i % 2 else 170 for i in range(50)]
+        with (patch('kindlecomicconverter.chapter_pairing.sample_edges', return_value=()) as sample,
+              patch('kindlecomicconverter.chapter_pairing.sample_strips', return_value=(signal, signal)) as strips,
+              patch('kindlecomicconverter.chapter_pairing.score_edges', side_effect=[None, None, 12.5])):
+            report = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)
+        self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[3, 4], score=12.5))
+        self.assertEqual(sample.call_count, 4)
+        self.assertEqual(strips.call_count, 2)
 
     def test_last_wide_page_forces_whole_chapter_native_without_sampling(self):
         with patch('kindlecomicconverter.chapter_pairing.sample_edges') as sample:
