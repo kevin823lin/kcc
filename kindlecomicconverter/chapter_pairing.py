@@ -55,7 +55,7 @@ def sample_strips(image):
     return tuple(strips)
 
 
-def score_strips(earlier, later, direction):
+def score_strips(earlier, later, direction, *, fallback=False):
     """Return full-strip Pearson correlation when non-margin bins corroborate it."""
     if direction not in ('rtl', 'ltr'):
         raise ValueError('Pairing direction must be rtl or ltr')
@@ -69,13 +69,13 @@ def score_strips(earlier, later, direction):
     if len(pairs) < 15:
         return None
 
-    if sum(abs(a - b) for a, b in zip(first, second)) > 16 * SAMPLE_POINTS:
+    if sum(abs(a - b) for a, b in zip(first, second)) > (25 if fallback else 16) * SAMPLE_POINTS:
         return None
     a, b = zip(*pairs)
-    if pvariance(a) < 100 or pvariance(b) < 100 or correlation(a, b) < .80:
+    if pvariance(a) < 100 or pvariance(b) < 100 or correlation(a, b) < (.60 if fallback else .80):
         return None
     score = correlation(first, second)
-    return min(1, score) if score >= .93 else None
+    return min(1, score) if score >= (.82 if fallback else .93) else None
 
 
 def score_edges(earlier, later, direction):
@@ -130,6 +130,7 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
         shift, anchor = bool(spreadshift), None
         if not wide:
             previous = strip_previous = strip_anchor = strip_anchor_index = None
+            fallback_anchor = fallback_anchor_index = None
             for index, (source_id, path) in enumerate(pages):
                 with Image.open(path) as image:
                     current = sample_edges(image)
@@ -146,12 +147,21 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
                             strip_anchor = dict(source_ids=[pages[index - 1][0], source_id],
                                                 score=strip_score)
                             strip_anchor_index = index - 1
+                        elif fallback_anchor is None:
+                            fallback_score = score_strips(strip_previous, current_strip, direction, fallback=True)
+                            if fallback_score is not None:
+                                fallback_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                                       score=fallback_score, method='strip_fallback')
+                                fallback_anchor_index = index - 1
                 previous = current
                 if strip_anchor is None:
                     strip_previous = current_strip
             if anchor is None and strip_anchor is not None:
                 shift = bool(strip_anchor_index % 2)
                 anchor = dict(strip_anchor, method='strip')
+            elif anchor is None and fallback_anchor is not None:
+                shift = bool(fallback_anchor_index % 2)
+                anchor = fallback_anchor
         report['chapters'].append(dict(
             id=chapter_id, title=title, source_ids=[page[0] for page in pages],
             mode='native' if wide else 'paired', spreadshift=shift,

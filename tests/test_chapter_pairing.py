@@ -105,6 +105,18 @@ class EdgeTests(unittest.TestCase):
         self.assertEqual(sample_strips(Image.new('I;16', (3, 50), 32768))[0], [128] * 50)
         self.assertEqual(sample_strips(Image.new('RGBA', (3, 50), (0, 0, 0, 128)))[0], [127] * 50)
 
+    def test_fallback_accepts_noisy_seams_but_keeps_signal_and_distance_guards(self):
+        signal = [80 if i % 2 else 170 for i in range(50)]
+        noisy = [value + (35, -35, 0)[i % 3] for i, value in enumerate(signal)]
+        for direction in ('rtl', 'ltr'):
+            self.assertIsNone(score_strips((signal,) * 2, (noisy,) * 2, direction))
+            self.assertGreaterEqual(score_strips((signal,) * 2, (noisy,) * 2, direction, fallback=True), .82)
+        for other in ([value + 26 for value in signal], signal[::-1], [120] * 50):
+            self.assertIsNone(score_strips((signal,) * 2, (other,) * 2, 'rtl', fallback=True))
+        for signal in ([255] * 40 + [80, 170] * 5, [0] * 40 + [80, 170] * 5,
+                       [120] * 50, [255] * 36 + [80, 170] * 7):
+            self.assertIsNone(score_strips((signal,) * 2, (signal,) * 2, 'rtl', fallback=True))
+
 
 class AnalysisTests(unittest.TestCase):
     def setUp(self):
@@ -192,6 +204,29 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[3, 4], score=12.5))
         self.assertEqual(sample.call_count, 4)
         self.assertEqual(strips.call_count, 2)
+
+    def test_fallback_is_deferred_until_all_legacy_candidates_are_checked(self):
+        pages = self.pages(4)
+        signal = [80 if i % 2 else 170 for i in range(50)]
+        for legacy in ('rgb', 'strip', None):
+            with self.subTest(legacy=legacy):
+                def score(earlier, later, direction, *, fallback=False):
+                    return .85 if fallback else next(strict)
+                strict = iter([None, .95 if legacy == 'strip' else None, None])
+                with (patch('kindlecomicconverter.chapter_pairing.sample_strips', return_value=(signal,) * 2),
+                      patch('kindlecomicconverter.chapter_pairing.score_edges',
+                            side_effect=[None, None, 12.5 if legacy == 'rgb' else None]),
+                      patch('kindlecomicconverter.chapter_pairing.score_strips', side_effect=score)):
+                    chapter = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)['chapters'][0]
+                if legacy == 'rgb':
+                    self.assertEqual(chapter['anchor'], dict(source_ids=[3, 4], score=12.5))
+                    self.assertFalse(chapter['spreadshift'])
+                elif legacy == 'strip':
+                    self.assertEqual(chapter['anchor'], dict(source_ids=[2, 3], score=.95, method='strip'))
+                    self.assertTrue(chapter['spreadshift'])
+                else:
+                    self.assertEqual(chapter['anchor'], dict(source_ids=[1, 2], score=.85, method='strip_fallback'))
+                    self.assertFalse(chapter['spreadshift'])
 
     def test_last_wide_page_forces_whole_chapter_native_without_sampling(self):
         with patch('kindlecomicconverter.chapter_pairing.sample_edges') as sample:
