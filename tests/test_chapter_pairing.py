@@ -6,7 +6,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from kindlecomicconverter.chapter_pairing import (
-    analyze_chapters, pair_geometry, resize_method, sample_edges, sample_strips, score_edges, score_strips,
+    analyze_chapters, pair_geometry, resize_method, sample_edges, sample_strips,
+    score_edge_profiles, score_edges, score_strips,
 )
 
 
@@ -102,8 +103,32 @@ class EdgeTests(unittest.TestCase):
         self.assertGreaterEqual(score, .93)
 
     def test_strip_sampling_scales_16_bit_and_composites_transparency(self):
-        self.assertEqual(sample_strips(Image.new('I;16', (3, 50), 32768))[0], [128] * 50)
-        self.assertEqual(sample_strips(Image.new('RGBA', (3, 50), (0, 0, 0, 128)))[0], [127] * 50)
+        for width in (1, 8):
+            self.assertEqual(sample_strips(Image.new('I;16', (3, 50), 32768), width=width)[0], [128] * 50)
+            self.assertEqual(sample_strips(Image.new('RGBA', (3, 50), (0, 0, 0, 128)), width=width)[0], [127] * 50)
+
+    def test_edge_profiles_require_separated_corroborating_contours(self):
+        profile = [0] * 20 + [160] + [0] * 26 + [40, 160, 150]
+        shifted = [value + 3 for value in profile]
+        blank = [255] * 50
+        self.assertIsNone(score_strips((profile,) * 2, (shifted,) * 2, 'rtl', fallback=True))
+        for direction, earlier, later in (
+                ('rtl', (profile, blank), (blank, shifted)),
+                ('ltr', (blank, profile), (shifted, blank))):
+            self.assertAlmostEqual(score_edge_profiles(earlier, later, direction), 1)
+        for other in (blank, list(range(0, 250, 5)), [0] * 25 + [160] * 25,
+                      [0] * 20 + [40, 160] + [160] * 5 + [40, 0] + [0] * 21,
+                      [0] * 20 + [40, 160, 40, 160, 0] + [0] * 25):
+            self.assertIsNone(score_edge_profiles((other,) * 2, (other,) * 2, 'rtl'))
+        self.assertIsNone(score_edge_profiles((profile,) * 2,
+                                             ([value + 17 for value in profile],) * 2, 'rtl'))
+        # Smooth profiles may correlate while their small contours disagree.
+        ramp = [30 + 3 * i + (12 if i % 2 else -12) for i in range(50)]
+        jittered = [30 + 3 * i + (12 if i % 3 else -12) for i in range(50)]
+        self.assertIsNone(score_edge_profiles((ramp,) * 2, (jittered,) * 2, 'rtl'))
+        for direction in ('rtl', 'vertical'):
+            with self.assertRaises(ValueError):
+                score_edge_profiles(([], []), ([], []), direction)
 
     def test_fallback_accepts_noisy_seams_but_keeps_signal_and_distance_guards(self):
         signal = [80 if i % 2 else 170 for i in range(50)]
@@ -203,7 +228,40 @@ class AnalysisTests(unittest.TestCase):
             report = analyze_chapters([('chapter', pages)], [100, 200], 'rtl', True)
         self.assertEqual(report['chapters'][0]['anchor'], dict(source_ids=[3, 4], score=12.5))
         self.assertEqual(sample.call_count, 4)
-        self.assertEqual(strips.call_count, 2)
+        self.assertEqual(strips.call_count, 4)
+
+    def test_real_outermost_profiles_detect_narrow_contours_in_both_directions(self):
+        profile = [0] * 20 + [160] + [0] * 26 + [40, 160, 150]
+        for direction in ('rtl', 'ltr'):
+            pages = self.pages(4)
+            columns = (0, 49) if direction == 'rtl' else (49, 0)
+            for (_, path), x in zip(pages[1:3], columns):
+                with Image.open(path) as source:
+                    image = source.copy()
+                for y in range(100):
+                    image.putpixel((x, y), (profile[y // 2],) * 3)
+                image.save(path)
+            chapter = analyze_chapters([('chapter', pages)], [100, 200], direction)['chapters'][0]
+            self.assertEqual(chapter['anchor'], dict(source_ids=[2, 3], score=1, method='edge_profile'))
+            self.assertTrue(chapter['spreadshift'])
+
+    def test_edge_profile_waits_for_all_higher_priority_candidates(self):
+        pages = self.pages(4)
+        for method in ('rgb', 'strip', 'strip_fallback', 'edge_profile'):
+            with self.subTest(method=method):
+                strict_scores = iter([None, .96 if method == 'strip' else None, None])
+                fallback_scores = iter([None, .96 if method == 'strip_fallback' else None, None])
+                def strips(earlier, later, direction, *, fallback=False):
+                    return next(fallback_scores if fallback else strict_scores)
+                with (patch('kindlecomicconverter.chapter_pairing.score_edges',
+                            side_effect=[None, 12.5 if method == 'rgb' else None, None]),
+                      patch('kindlecomicconverter.chapter_pairing.score_strips', side_effect=strips),
+                      patch('kindlecomicconverter.chapter_pairing.score_edge_profiles', return_value=.98) as profile):
+                    chapter = analyze_chapters([('chapter', pages)], [100, 200], 'rtl')['chapters'][0]
+                profile.assert_called_once()
+                self.assertEqual(chapter['anchor'].get('method', 'rgb'), method)
+                self.assertEqual(chapter['anchor']['source_ids'], [1, 2] if method == 'edge_profile' else [2, 3])
+                self.assertEqual(chapter['spreadshift'], method != 'edge_profile')
 
     def test_fallback_is_deferred_until_all_legacy_candidates_are_checked(self):
         pages = self.pages(4)

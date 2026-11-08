@@ -745,7 +745,9 @@ def analyzeChapterPairing(images_path, chapter_names, source, job_progress=''):
         elif chapter['anchor']:
             anchor = chapter['anchor']
             first = anchor['source_ids'][0] - chapter['source_ids'][0] + 1
-            if anchor.get('method') == 'strip_fallback':
+            if anchor.get('method') == 'edge_profile':
+                metric = f'outer edge correlation {anchor["score"]:.3f}'
+            elif anchor.get('method') == 'strip_fallback':
                 metric = f'fallback strip correlation {anchor["score"]:.3f}'
             elif anchor.get('method') == 'strip':
                 metric = f'strip correlation {anchor["score"]:.3f}'

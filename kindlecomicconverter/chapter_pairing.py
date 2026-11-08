@@ -35,12 +35,12 @@ def sample_edges(image):
     return tuple(edges)
 
 
-def sample_strips(image):
-    """Return 50 mean grayscale samples from each 8px inner edge strip."""
-    width, height = image.size
+def sample_strips(image, *, width=STRIP_WIDTH):
+    """Return 50 mean grayscale samples from each inner edge strip."""
+    image_width, height = image.size
     strips = []
-    for box in ((0, 0, min(STRIP_WIDTH, width), height),
-                (max(0, width - STRIP_WIDTH), 0, width, height)):
+    for box in ((0, 0, min(width, image_width), height),
+                (max(0, image_width - width), 0, image_width, height)):
         strip = image.crop(box)
         if 'I;16' in image.mode:
             reduced = strip.resize((1, SAMPLE_POINTS), Image.Resampling.BOX)
@@ -76,6 +76,30 @@ def score_strips(earlier, later, direction, *, fallback=False):
         return None
     score = correlation(first, second)
     return min(1, score) if score >= (.82 if fallback else .93) else None
+
+
+def score_edge_profiles(earlier, later, direction):
+    """Match narrow contours only when their brightness changes corroborate them."""
+    if direction not in ('rtl', 'ltr'):
+        raise ValueError('Pairing direction must be rtl or ltr')
+    first, second = (earlier[0], later[1]) if direction == 'rtl' else (earlier[1], later[0])
+    if len(first) != SAMPLE_POINTS or len(second) != SAMPLE_POINTS:
+        raise ValueError('Pairing requires 50 samples per edge profile')
+    if sum(abs(a - b) for a, b in zip(first, second)) > 16 * SAMPLE_POINTS:
+        return None
+    changes = [[b - a for a, b in zip(profile, profile[1:])] for profile in (first, second)]
+    active = [(index, a > 0) for index, (a, b) in enumerate(zip(*changes))
+              if abs(a) >= 10 and abs(b) >= 10 and a * b > 0]
+    # A single shared border or horizontal band is not independent artwork.
+    if (len(active) < 4 or active[-1][0] - active[0][0] < SAMPLE_POINTS // 4
+            or sum(a[1] != b[1] for a, b in zip(active, active[1:])) < 2):
+        return None
+    if min(pvariance(profile) for profile in (first, second, *changes)) < 100:
+        return None
+    if correlation(*changes) < .85:
+        return None
+    score = correlation(first, second)
+    return min(1, score) if score >= .95 else None
 
 
 def score_edges(earlier, later, direction):
@@ -131,10 +155,14 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
         if not wide:
             previous = strip_previous = strip_anchor = strip_anchor_index = None
             fallback_anchor = fallback_anchor_index = None
+            profile_previous = profile_anchor = profile_anchor_index = None
             for index, (source_id, path) in enumerate(pages):
                 with Image.open(path) as image:
                     current = sample_edges(image)
                     current_strip = sample_strips(image) if strip_anchor is None else None
+                    current_profile = (sample_strips(image, width=1)
+                                       if strip_anchor is None and fallback_anchor is None
+                                       and profile_anchor is None else None)
                 if previous is not None:
                     score = score_edges(previous, current, direction)
                     if score is not None:
@@ -153,7 +181,14 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
                                 fallback_anchor = dict(source_ids=[pages[index - 1][0], source_id],
                                                        score=fallback_score, method='strip_fallback')
                                 fallback_anchor_index = index - 1
+                    if strip_anchor is None and fallback_anchor is None and profile_anchor is None:
+                        profile_score = score_edge_profiles(profile_previous, current_profile, direction)
+                        if profile_score is not None:
+                            profile_anchor = dict(source_ids=[pages[index - 1][0], source_id],
+                                                  score=profile_score, method='edge_profile')
+                            profile_anchor_index = index - 1
                 previous = current
+                profile_previous = current_profile
                 if strip_anchor is None:
                     strip_previous = current_strip
             if anchor is None and strip_anchor is not None:
@@ -162,6 +197,9 @@ def analyze_chapters(chapters, target, direction, spreadshift=False):
             elif anchor is None and fallback_anchor is not None:
                 shift = bool(fallback_anchor_index % 2)
                 anchor = fallback_anchor
+            elif anchor is None and profile_anchor is not None:
+                shift = bool(profile_anchor_index % 2)
+                anchor = profile_anchor
         report['chapters'].append(dict(
             id=chapter_id, title=title, source_ids=[page[0] for page in pages],
             mode='native' if wide else 'paired', spreadshift=shift,
