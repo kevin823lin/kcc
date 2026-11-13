@@ -21,8 +21,9 @@ from datetime import datetime, timezone
 import itertools
 import json
 from pathlib import Path
+import platform
 from PySide6.QtCore import (QSize, QUrl, Qt, Signal, QIODeviceBase, QEvent, QThread, QSettings,
-                            QCoreApplication, QT_TRANSLATE_NOOP, QObject)
+                            QCoreApplication, QT_TRANSLATE_NOOP, QObject, qVersion)
 from PySide6.QtGui import (QActionGroup, QColor, QIcon, QImage, QKeyEvent, QPixmap, QDesktopServices)
 from PySide6.QtWidgets import (QApplication, QDialogButtonBox, QHBoxLayout, QLabel, QListWidgetItem, QMainWindow, QSizePolicy, QSystemTrayIcon, QFileDialog, QMessageBox, QDialog, QAbstractItemView, QListView, QTreeView, QWidget,
                                QToolButton, QMenu)
@@ -49,7 +50,7 @@ from .KCC_spread_label import LabelSpreadsDialog
 from .shared import HTMLStripper, sanitizeTrace, walkLevel
 from .image import ProfileData
 from .comicarchive import SEVENZIP, TAR, available_archive_tools
-from .comic2ebook import OS_SORT_KEY, KF7_KINDLES, flattenTree, getWorkFolder, removeNonImages, sanitizeTree, detectKindleGen
+from .comic2ebook import KOBO_TOUCH_DRIVER_REGEX, OS_SORT_KEY, KF7_KINDLES, flattenTree, getWorkFolder, removeNonImages, sanitizeTree, detectKindleGen
 from . import __version__
 from . import i18n
 from . import comic2ebook
@@ -182,6 +183,9 @@ class VersionThread(QThread):
                 json_parser = requests.get("https://api.github.com/repos/ciromattia/kcc/releases/latest").json()
 
                 html_url = json_parser["html_url"]
+                if not html_url.startswith('https://github.com/ciromattia/kcc/releases/tag/'):
+                    print('Somehow you got MITM')
+                    raise Exception('Somehow you got MITM')
                 latest_version = json_parser["tag_name"]
                 latest_version = re.sub(r'^v', "", latest_version)
 
@@ -198,6 +202,16 @@ class VersionThread(QThread):
                                        headers={
                                            'Accept': 'application/vnd.github.raw+json',
                                            'X-GitHub-Api-Version': '2022-11-28'}).json()
+            link_allowlist = (
+                'https://humblebundleinc.sjv.io/',
+                'https://www.humblebundle.com/',
+                'https://www.awin1.com/',
+                'https://www.fanatical.com/',
+                'https://kodansha.us/',
+                'https://youtu.be/',
+                'https://www.youtube.com/',
+                'https://www.linkedin.com/',
+            )
             for category, payloads in announcements.items():
                 for payload in payloads:
                     if not isinstance(payload, dict):
@@ -217,8 +231,12 @@ class VersionThread(QThread):
                     if category == 'kofi':
                         icon = 'kofi'
                     message = f"{payload.get('name')}"
-                    if payload.get('link'):
-                        message = '<a href="{}"><b>{}</b></a>'.format(payload.get('link'), payload.get('name'))
+                    link = payload.get('link')
+                    if link:
+                        for allowed_link in link_allowlist:
+                            if link.startswith(allowed_link):
+                                message = '<a href="{}"><b>{}</b></a>'.format(payload.get('link'), payload.get('name'))
+                                break
                     if payload.get('showDeadline'):
                         message += f': {time_left}'
                     if category == 'humbleBundles':
@@ -442,17 +460,12 @@ class WorkerThread(QThread):
                 if options.output is None:
                     options.output = fusion_source_parent
                 currentJobs.clear()
-                job, fusion_cover_path = comic2ebook.makeFusion(bookDir)
+                job, fusion_cover_path = comic2ebook.makeFusion(bookDir, self)
                 currentJobs.append(job)
                 MW.addMessage.emit(i18n.tr_arg(QCoreApplication.translate('KCCGUI', 'Created fusion at %1'), currentJobs[0]), 'info', False)
             except Exception as e:
                 print('Fusion Failed. ' + str(e))
                 MW.addMessage.emit(i18n.tr_arg(QCoreApplication.translate('KCCGUI', 'Fusion Failed. %1'), str(e)), 'error', True)
-        elif len(currentJobs) > 1 and options.title != 'defaulttitle':
-            currentJobs.clear()
-            error_message = QCoreApplication.translate('KCCGUI', 'Process Failed. Custom title can\'t be set when processing more than 1 source.\nDid you forget to check fusion?')
-            print(error_message)
-            MW.addMessage.emit(error_message, 'error', True)
         for i, job in enumerate(currentJobs, start=1):
             job_progress_number = f'[{i}/{len(currentJobs)}] '
             sleep(0.5)
@@ -477,6 +490,8 @@ class WorkerThread(QThread):
             jobargv.append(job)
             try:
                 comic2ebook.options = comic2ebook.checkOptions(copy(options))
+                if len(currentJobs) > 1 and comic2ebook.options.title != 'defaulttitle':
+                    comic2ebook.options.title += f' {i:0{len(str(len(currentJobs)))}}'
                 outputPath = comic2ebook.makeBook(job, fusion_cover_path, self, job_progress_number)
                 MW.hideProgressBar.emit()
             except UserWarning as warn:
@@ -960,6 +975,7 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
         GUI.defaultOutputFolderButton.setEnabled(status)
         GUI.clearButton.setEnabled(status)
         GUI.fileButton.setEnabled(status)
+        GUI.directoryButton.setEnabled(status)
         GUI.formatBox.setEnabled(status)
         GUI.optionWidget.setEnabled(status)
         GUI.gammaWidget.setEnabled(status)
@@ -1190,6 +1206,8 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
         else:
             self.modeChange(1)
         GUI.colorBox.setChecked(profile['ForceColor'])
+        if profile['Label'] not in ('KCS', 'KSCS', 'KoLC', 'KoCC'):
+            GUI.eraseRainbowBox.setChecked(False)
         self.changeFormat()
         if not GUI.webtoonBox.isChecked():
             GUI.qualityBox.setEnabled(profile['PVOptions'])
@@ -1317,11 +1335,21 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
             self.conversionAlive = False
             self.worker.sync()
         else:
+            parent = Path(self.jobList.item(0).text()).parent
+            name = parent.name
+            if GUI.deviceBox.currentText().startswith('Kobo') and GUI.formatBox.currentText() == 'EPUB':
+                name = KOBO_TOUCH_DRIVER_REGEX.sub('_', name)
+
             if QApplication.keyboardModifiers() == Qt.KeyboardModifier.ShiftModifier:
                 if not self.selectOutputFolder():
                     return
+            elif GUI.defaultOutputFolderBox.checkState() == Qt.CheckState.PartiallyChecked:
+                target_path = parent.joinpath(f"{name} [kcc]")
+                if not target_path.exists():
+                    target_path.mkdir()
+                self.targetDirectory = str(target_path)
             elif GUI.defaultOutputFolderBox.isChecked():
-                self.targetDirectory = self.defaultOutputFolder
+                self.targetDirectory = os.path.join(self.defaultOutputFolder, f"{name} [kcc]")
             else:
                 GUI.targetDirectory = ''
             self.progress.start()
@@ -1332,12 +1360,6 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
                 self.addMessage(QT_TRANSLATE_NOOP('KCCGUI', 'No files selected! Please choose files to convert.'), 'error')
                 self.needClean = True
                 return
-            if GUI.defaultOutputFolderBox.checkState() == Qt.CheckState.PartiallyChecked:
-                parent = Path(self.jobList.item(0).text()).parent
-                target_path = parent.joinpath(f"{parent.name}")
-                if not target_path.exists():
-                    target_path.mkdir()
-                self.targetDirectory = str(target_path)
             if self.currentMode > 2 and (GUI.widthBox.value() == 0 or GUI.heightBox.value() == 0):
                 GUI.jobList.clear()
                 self.addMessage(QT_TRANSLATE_NOOP('KCCGUI', 'Target resolution is not set!'), 'error')
@@ -1481,7 +1503,10 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
         APP = kccapp
         MW = kccwindow
         GUI = self
-        self.settings = QSettings('ciromattia', 'kcc10')
+        settings_key = 'kcc10'
+        if Version(qVersion()) <= Version('6.4.3'):
+            settings_key += '-legacy'
+        self.settings = QSettings('ciromattia', settings_key)
         self.language = str(self.settings.value('language', i18n.DEFAULT_LANGUAGE))
         self.language = i18n.apply_language(self.language)
         self.setupUi(MW)
@@ -1509,7 +1534,8 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
         default_options = {'gammaSlider': 0, 'croppingBox': 2, 'croppingPowerSlider': 100, 'rotateBox': 1, 'mangaBox': 2}
         try:
             self.options = self.settings.value('options', default_options)
-        except Exception:
+        except Exception as e:
+            print(e)
             self.options = default_options
         self.worker = WorkerThread()
         self.worker.setObjectName('worker')
@@ -1568,6 +1594,9 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
                              'DefaultUpscale': True, 'ForceColor': False, 'Label': 'KPW34'},
             "Kindle Voyage": {'PVOptions': True, 'ForceExpert': False, 'DefaultFormat': 0,
                               'DefaultUpscale': True, 'ForceColor': False, 'Label': 'KV'},
+            "Kindle 1440x1920": {
+                'PVOptions': True, 'ForceExpert': False, 'DefaultFormat': 0, 'DefaultUpscale': False, 'ForceColor': False, 'Label': 'K1920',
+            },
             "Kindle 1860x1920": {
                 'PVOptions': True, 'ForceExpert': False, 'DefaultFormat': 0, 'DefaultUpscale': False, 'ForceColor': False, 'Label': 'KS1860',
             },
@@ -1704,6 +1733,7 @@ class KCCGUI(QObject, KCC_ui.Ui_mainWindow):
             "Kindle 1920x1920",
             "Kindle 1860x1920",
             "Kindle 1240x1860",
+            "Kindle 1440x1920",
             "Separator",
             "Kobo Aura",
             "Kobo Aura ONE",

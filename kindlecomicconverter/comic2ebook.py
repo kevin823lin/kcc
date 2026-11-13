@@ -1250,8 +1250,7 @@ def getOutputFilename(srcpath, wantedname, ext, tomenumber):
     if options.folder_output:
         ext = ''
     source_path = Path(srcpath)
-    if srcpath[-1] == os.path.sep:
-        srcpath = srcpath[:-1]
+
     if 'Ko' in options.profile and options.format == 'EPUB':
         if options.noKepub:
             # Just use normal epub extension if no_kepub option is true
@@ -1259,52 +1258,46 @@ def getOutputFilename(srcpath, wantedname, ext, tomenumber):
         else:
             ext = '.kepub.epub'
 
-    custom_output_directory = False
     if wantedname:
-        wanted_root, wanted_ext = os.path.splitext(wantedname)
-        # so you could have an output folder with . in the filename
-        if not options.folder_output and wantedname.endswith(ext):
-            filename = os.path.abspath(wantedname)
-        elif wanted_ext == '.mobi' and ext == '.epub':
-            filename = os.path.abspath(wanted_root + ext)
-        else:
-            custom_output_directory = True
-            abs_path = os.path.abspath(options.output)
-            if not os.path.exists(abs_path):
-                os.mkdir(abs_path)
+        abs_path = os.path.abspath(options.output)
+        if not os.path.exists(abs_path):
+            os.mkdir(abs_path)
+    else:
+        abs_path = source_path.parent
 
-    if not wantedname or custom_output_directory:
-        if 'Ko' in options.profile and options.format == 'EPUB':
-            if source_path.is_file():
-                name = KOBO_TOUCH_DRIVER_REGEX.sub('_', source_path.stem) + tomenumber + ext
-            else:
-                name = KOBO_TOUCH_DRIVER_REGEX.sub('_', source_path.name) + tomenumber + ext
+    if options.title != 'defaulttitle':
+        name = options.title
+    else:
+        if source_path.is_file():
+            name = source_path.stem
         else:
-            if source_path.is_file():
-                name = source_path.stem + tomenumber + ext
-            else:
-                name = source_path.name + tomenumber + ext
+            name = source_path.name
 
-        if custom_output_directory:
-            filename = os.path.join(os.path.abspath(options.output), name)
-        else:
-            filename = source_path.with_name(name)
+    if 'Ko' in options.profile and options.format == 'EPUB':
+        name = KOBO_TOUCH_DRIVER_REGEX.sub('_', name)
 
-    if os.path.exists(filename):
-        counter = 0
-        basename = os.path.splitext(filename)[0]
-        if ext == '.kepub.epub':
-            basename = os.path.splitext(basename)[0]
-        while os.path.exists(basename + '_kcc' + str(counter) + ext):
-            counter += 1
-        filename = basename + '_kcc' + str(counter) + ext
-    elif options.format == 'MOBI' and ext == '.epub':
-        counter = 0
-        basename = os.path.splitext(filename)[0]
-        if os.path.isfile(basename + '.mobi'):
-            while os.path.isfile(basename + '_kcc' + str(counter) + '.mobi'):
-                counter += 1
-            filename = basename + '_kcc' + str(counter) + ext      
+    windows = sys.platform.startswith('win')
+    encoding, unit = ('utf-16-le', 2) if windows else ('utf-8', 1)
+    limit = 255
+    if windows:
+        # Keep ordinary Windows paths below MAX_PATH, including the terminating NUL.
+        parent = os.path.join(os.path.abspath(abs_path), '')
+        limit = min(limit, 259 - len(parent.encode(encoding)) // unit)
+
+    def output_filename(counter=None):
+        suffix = tomenumber + (f'_kcc{counter}' if counter is not None else '') + ext
+        available = limit - len(suffix.encode(encoding)) // unit
+        if available < 1:
+            raise ValueError(f'Output directory leaves no room for a filename: {abs_path}')
+        stem = name.encode(encoding)[:available * unit].decode(encoding, errors='ignore') or '_'
+        return os.path.join(abs_path, stem + suffix)
+
+    filename = output_filename()
+    counter = 0
+    while os.path.exists(filename) or (options.format == 'MOBI' and ext == '.epub'
+                                     and os.path.isfile(os.path.splitext(filename)[0] + '.mobi')):
+        filename = output_filename(counter)
+        counter += 1
     return str(filename)
 
 
@@ -2072,7 +2065,9 @@ def checkPre(source='KCC-'):
             if tempdir.startswith(source):
                 rmtree(os.path.join(root, tempdir), True)
 
-def makeFusion(sources: List[str]):
+def makeFusion(sources: List[str], qtgui=None):
+    global GUI
+    GUI = qtgui
     if len(sources) < 2:
         raise UserWarning(QCoreApplication.translate("KCCGUI", 'Fusion requires at least 2 sources. Did you forget to uncheck fusion?'))
     start = perf_counter()
